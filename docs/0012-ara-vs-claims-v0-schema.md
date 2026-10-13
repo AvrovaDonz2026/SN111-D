@@ -1,500 +1,123 @@
-# Claims Agent Schema vs Claims v0 Schema
+# Claims extraction: `section_context_v1` vs `agent_v1` schemas
 
-This document compares two Claims-owned schemas:
+This updates the earlier Agent-versus-v0 note to compare the **persisted miner outputs**, not just their extraction prompts. Both are Claims-owned schemas. `agent_v1` uses an ARA-style artifact layout, but its JSON contract is defined in this repository.
 
-- **Claims v0 schema**: the older flat claim/evidence schema used by `miner.v0`,
-  `section_context_v1`, early validators, and review imports.
-- **Claims Agent schema**: the newer `agent_v1` schema written to
-  `agent_output.json`.
+Sources: [`section_context_v1/runner.py`](../miner/section_context_v1/runner.py), its [output models](../miner/section_context_v1/models.py) and [flat extraction models](../miner/section_context_v1/schema_models.py); [`agent_v1/artifact_models.py`](../miner/agent_v1/artifact_models.py), its [runner](../miner/agent_v1/runner.py), and [validator](../miner/agent_v1/artifact_validator.py). The tables enumerate every declared field of the persisted models and every top-level key assembled by the section-context runner.
 
-The newer schema is called the **Agent schema** because
-agent loops are better suited to filling its richer fields: reasoning layers,
-source refs, experiments, trace, and runtime metadata. It also builds on the
-artifact layout ideas from
-[ARA](https://github.com/ARA-Labs/Agent-Native-Research-Artifact), but it is not
-the upstream ARA schema. It is our JSON contract.
+**Notation:** `*` = required by that Pydantic model (no default); `?` = nullable; `=[]`, `={}`, or `=value` = default. These are model requirements, not necessarily prompt or validation requirements. “No direct field” means there is no dedicated schema slot, even if a value could be put in free-form metadata.
 
-## Summary
+## Stage 1 — Main output and sidecars
 
-Claims v0 is a compact extraction schema:
+| `section_context_v1` | `agent_v1` |
+| --- | --- |
+| Main file: `section_context_v1_output.json` | Main file: `agent_output.json` |
+| `paper`, `sections[]`, `section_summaries[]`, `paper_summary`, `section_extraction_plan[]`, `claims[]`, `evidence_items[]`, `claim_evidence_links[]`, `raw_section_outputs[]` | `ara_version`, `paper`, `logic`, `evidence`, `trace`, `src`, `metadata` |
+| Separate `artifact.json`: source `paper`, `spans[]`, input `claims[]`, `evidence_items[]`, `claim_evidence_links[]`, `metadata` | Separate `source_payload.json`: input paper and spans; `agent_schema.json`: generated JSON Schema for the main output |
+| Also writes `extracted_claims.csv`, `manifest.json`, optionally `tei.xml` | Also writes an ARA-style Markdown tree, `manifest.json`, and `agent_validation_report.json` |
 
-```text
-paper
-spans
-claims[]
-evidence_items[]
-claim_evidence_links[]
-metadata
-```
+Here are the **complete top-level keys** of the two main JSON files:
 
-The Claims Agent schema is a richer artifact schema:
+| `section_context_v1_output.json` | `agent_output.json` |
+| --- | --- |
+| `paper: Paper` | `ara_version: string = "1.0"` |
+| `sections: SectionRecord[]` | `paper: Paper*` |
+| `section_summaries: SectionSummaryRecord[]` | `logic: Logic*` |
+| `paper_summary: PaperSummaryRecord` | `evidence: EvidenceLayer*` |
+| `section_extraction_plan: SectionExtractionDecision[]` | `trace: TraceNode*` |
+| `claims: Claim[]` | `src: SrcLayer*` |
+| `evidence_items: EvidenceItem[]` | `metadata: object = {}` |
+| `claim_evidence_links: ClaimEvidenceLink[]` | — |
+| `raw_section_outputs: object[]` | — |
 
-```text
-ara_version
-paper
-logic
-  problem_observations[]
-  gaps[]
-  key_insight
-  assumptions[]
-  claims[]
-  concepts[]
-  experiments[]
-  related_work[]
-  constraints[]
-evidence
-  records[]
-  ledger_notes[]
-trace
-src
-metadata
-```
+The section-context envelope is assembled in the runner rather than declared as a single Pydantic model. It has **no top-level `spans` or `metadata` key**. Source spans are in the separate `artifact.json`. Each `raw_section_outputs[]` entry has `section`, `decision`, `section_summary`, `raw_output` (selected raw model JSON), and `gated_claim_count`. Only sections sent to extraction get an entry; skipped sections still appear in the inventory and plan.
 
-The main change is not that v0 "cannot be used by agents." It can. The change is
-that the Agent schema gives an agent loop more useful places to put what it
-learns while reading a paper: claims, evidence, verification structure,
-definitions, assumptions, trace, and source-grounded quotes.
+## Stage 2 — Paper and source inventory
 
-## Why Adopt The Agent Schema
-
-We are making the Agent schema canonical for new miner work because it better
-matches the artifact we want miners to produce.
-
-It lets a miner preserve:
-
-- the paper's main claims
-- the evidence behind those claims
-- the conditions and falsification criteria for claims
-- the experiments or verification records that support claims
-- important concepts and definitions
-- source-grounded quotes and span IDs
-- reasoning or exploration trace
-- environment, artifact, and runtime metadata
-
-Claims v0 remains useful historical context and compatibility surface, but it is
-not the shape we should keep extending.
-
-## Top-Level Comparison
-
-| Area | Claims v0 | Claims Agent schema |
+| Concept | `section_context_v1` | `agent_v1` |
 | --- | --- | --- |
-| Current role | Legacy/compatibility schema | Canonical miner schema |
-| Main output | `section_context_v1_output.json`, `extracted_claims.csv` | `agent_output.json` plus generated markdown |
-| Miner path | `miner.v0`, `section_context_v1` | `miner.agent_v1` |
-| Validator path | older row/link validators | `validator.agent_v1` |
-| Claim location | `claims[]` | `logic.claims[]` |
-| Evidence location | `evidence_items[]` | `evidence.records[]` |
-| Claim/evidence relation | separate `claim_evidence_links[]` | IDs embedded in claims, evidence, and experiments |
-| Source grounding | span IDs | `SourceRef` objects with span IDs, quote, role, and optional path |
-| Reasoning structure | limited | `logic`, `trace`, and `src` layers |
-| Runtime metadata | generic `metadata` | `metadata.runtime_metrics` and backend details |
+| Paper | `paper.paper_id*`, `doi?`, `pmid?`, `title?`, `authors=[]`, `journal?`, `year?`, `source_type?`, `open_access?` | `paper.paper_id*`, `title=""`, `authors=[]`, `year?`, `venue?`, `doi?`, `domain?`, `keywords=[]`, `abstract=""`, `claims_summary=[]` |
+| Section record | `section_id*`, `paper_id*`, `section_name*`, `section_type*`, `section_source="tei_header"`, `section_title_quality="high"`, `original_section_name?`, `page_numbers=[]`, `span_ids=[]`, `text*`, `token_count=0`, `char_count=0` | No section collection in `agent_output.json` |
+| Source span | `artifact.json → spans[]`: `span_id*`, `paper_id*`, `section_type?`, `section_name?`, `page?`, `char_start?`, `char_end?`, `text*`, `table_id?`, `figure_id?`, `caption_id?`, `span_type="text"` | `source_payload.json → spans[]` is a run sidecar; output objects use `SourceRef` pointers |
 
-## Claims v0 Shape
+The flat `ExtractionArtifact` model serialized as section-context `artifact.json` has `paper*`, `spans=[]`, `claims=[]`, `evidence_items=[]`, `claim_evidence_links=[]`, `metadata={}`. Its `Span.span_type` accepts `text`, `table_cell`, `table_row`, `figure_caption`, or `other`. `artifact.json` is the supplied/ingested source artifact, while new extractions are written to `section_context_v1_output.json`.
 
-Claims v0 centers on flat review objects:
+## Stage 3 — Context and selection
 
-```json
-{
-  "paper": {},
-  "spans": [],
-  "claims": [],
-  "evidence_items": [],
-  "claim_evidence_links": [],
-  "metadata": {}
-}
-```
+| `section_context_v1` model and all fields | Closest `agent_v1` output fields |
+| --- | --- |
+| `SectionSummaryRecord`: `section_id*`, `section_name*`, `section_type*`, `summary_text*`, `section_role*`, `key_entities=[]`, `key_findings=[]`, `extractability_assessment=""`, `locality_confidence?` | No section-summary object. `logic.problem_observations=[]`, `gaps=[]`, `key_insight=""` and `paper.claims_summary=[]` may hold related synthesis, with different granularity. |
+| `PaperSummaryRecord`: `paper_id*`, `paper_title=""`, `paper_summary*`, `main_findings=[]`, `limitations=[]`, `evidence_map=[]` | `paper.abstract=""`, `paper.claims_summary=[]`; `logic.problem_observations=[]`, `gaps=[]`, `key_insight=""`, `assumptions=[]`, `related_work=[]`, `constraints=[]`. No single paper-summary field. |
+| `SectionExtractionDecision`: `section_id*`, `should_extract*`, `reason*`, `expected_claim_types=[]`, `expected_evidence_types=[]`, `likely_claim_density=""`, `likely_evidence_density=""`, `likely_context_completeness=""` | No section selection record. `trace` is an exploration tree, not an extraction plan. |
+| `raw_section_outputs[]`: `section`, `decision`, `section_summary`, `raw_output`, `gated_claim_count` | No raw per-section model-call record in the output artifact. |
 
-Its main objects are:
+The section-context pipeline builds sections, summarizes them, summarizes the paper, selects sections, extracts locally, and gates claim/evidence/link rows. Its summaries orient extraction; the prompt requires each emitted claim and evidence item to be grounded in raw section text. Agent v1 uses an agent runtime to construct its artifact, then checks the artifact's structure and references. These workflow differences explain part of the output difference.
 
-- `Claim`: a paper-owned claim row with `claim_text`, semantic
-  subject/predicate/object fields, source span IDs, details, and confidence.
-- `EvidenceItem`: a support record with summary, method, outcome type,
-  presentation type, source span IDs, and details.
-- `ClaimEvidenceLink`: a relationship row connecting one claim to one evidence
-  item.
+For each selected section, the raw extractor JSON is expected to contain `claims[]`, `evidence_items[]`, and `claim_evidence_links[]`. Raw links refer to `claim_index` and `evidence_index`; materialization turns those into stable IDs and persisted `ClaimEvidenceLink` rows. `raw_section_outputs[].raw_output` retains that raw JSON, including rows later removed by gating.
 
-This worked well for review tables and link-level scoring. It is direct,
-compact, and easy to export.
+## Stage 4 — Claims
 
-## Claims Agent Schema Shape
-
-The Agent schema is defined in
-[`miner/agent_v1/artifact_models.py`](../miner/agent_v1/artifact_models.py).
-At a high level, `agent_output.json` looks like this:
-
-```json
-{
-  "ara_version": "1.0",
-  "paper": {
-    "paper_id": "...",
-    "title": "...",
-    "authors": [],
-    "year": 2026,
-    "venue": null,
-    "doi": null,
-    "domain": null,
-    "keywords": [],
-    "abstract": "...",
-    "claims_summary": []
-  },
-  "logic": {
-    "problem_observations": [],
-    "gaps": [],
-    "key_insight": "...",
-    "assumptions": [],
-    "claims": [],
-    "concepts": [],
-    "experiments": [],
-    "related_work": [],
-    "constraints": []
-  },
-  "evidence": {
-    "records": [],
-    "ledger_notes": []
-  },
-  "trace": {
-    "node_id": "Q0",
-    "node_type": "question",
-    "support_level": "inferred",
-    "summary": "...",
-    "source_refs": [],
-    "evidence": [],
-    "children": []
-  },
-  "src": {
-    "environment": [],
-    "artifacts": []
-  },
-  "metadata": {}
-}
-```
-
-This is a Claims JSON schema inspired by ARA's artifact layout: paper, logic,
-evidence, trace, source/artifact notes, and metadata.
-
-A complete passing example from the Codex backend is checked in at
-[`examples/agent_v1/rietveld_codex_agent_output.json`](../examples/agent_v1/rietveld_codex_agent_output.json).
-It was generated from the Rietveld et al. 2013 Science paper and validates with
-zero deterministic schema issues. The paired validation report is
-[`examples/agent_v1/rietveld_codex_validation_report.json`](../examples/agent_v1/rietveld_codex_validation_report.json).
-
-For example, its `paper` layer starts like this:
-
-```json
-{
-  "paper_id": "Rietveld_et_al_2013_Science",
-  "title": "GWAS of 126,559 Individuals Identifies Genetic Variants Associated with Educational Attainment",
-  "authors": [
-    "Cornelius A. Rietveld",
-    "Sarah E. Medland",
-    "Jaime Derringer",
-    "Jian Yang",
-    "Tonu Esko",
-    "Nicolas W. Martin",
-    "Harm-Jan Westra",
-    "Peter M. Visscher",
-    "Daniel J. Benjamin",
-    "David Cesarini",
-    "Philipp D. Koellinger",
-    "Social Science Genetic Association Consortium"
-  ],
-  "year": 2013,
-  "venue": "Science",
-  "doi": "10.1126/science.1235488",
-  "domain": "social-science genetics; genome-wide association study; educational attainment",
-  "keywords": ["GWAS", "educational attainment", "EduYears", "College completion", "polygenic score"],
-  "claims_summary": [
-    "Three independent SNPs reached genome-wide significance and replicated for educational attainment phenotypes.",
-    "Individual SNP effect sizes on educational attainment are very small."
-  ]
-}
-```
-
-## Field Comparison
-
-| Concept | Claims v0 | Claims Agent schema |
+| Meaning | `section_context_v1` `claims[]: Claim` | `agent_v1` `logic.claims[]: Claim` |
 | --- | --- | --- |
-| Paper identity | `paper` | `paper` |
-| Source spans | `spans[]` | run sidecar `source_payload.json`; output uses `sources[]` on claims and `source_refs[]` elsewhere |
-| Claims | `claims[]` | `logic.claims[]` |
-| Claim text | `claims[].claim_text` | `logic.claims[].statement` |
-| Claim semantics | `subject`, `predicate`, `object`, `claim_kind` | free-form claim fields plus optional `metadata` |
-| Claim conditions | usually in `details` or absent | `logic.claims[].conditions` |
-| Falsifiability | usually absent | `logic.claims[].falsification_criteria` |
-| Evidence | `evidence_items[]` | `evidence.records[]` |
-| Evidence summary | `evidence_items[].summary_text` | `evidence.records[].summary` |
-| Evidence method/outcome/presentation | `SemanticField` objects | `evidence_method` is a string; `outcome_type` and `presentation_type` are strings or null |
-| Claim/evidence links | `claim_evidence_links[]` | `logic.claims[].evidence_ids[]`, `evidence.records[].linked_claim_ids[]`, and experiment links |
-| Experiments/proofs | no first-class layer | `logic.experiments[]`, claim `proof[]` |
-| Concepts | no first-class layer | `logic.concepts[]` |
-| Trace | no first-class layer | `trace` |
-| Runtime telemetry | generic `metadata` | `metadata.runtime_metrics` |
+| Identity | `claim_id*`, `paper_id*` | `claim_id*`, `source_claim_id?` |
+| Statement | `claim_text*` | `statement*` |
+| Structured relation | `subject*`, `predicate*`, `object*` (`SemanticField` each) | No direct subject/predicate/object fields |
+| Classification | `claim_kind*`, `claim_profile?`, `epistemic_status*`, `support_origin*` | `status*`; its meaning is not guaranteed to match those flat fields |
+| Applicability and payload | `context={}` (`SemanticField` map), `details={}` (arbitrary JSON) | `conditions*`, `metadata={}` |
+| Testability | No dedicated field | `falsification_criteria*` |
+| Source grounding | `source_span_ids=[]` | `sources=[]` (`SourceRef[]`) |
+| Support | Separate `claim_evidence_links[]` | `evidence_ids=[]`; `proof=[]` (experiment IDs) |
+| Claim graph | No dedicated field | `dependencies=[]` (claim IDs) |
+| Confidence | `extractor_confidence?` | No dedicated field |
 
-## Claim Example
+The nested flat models are complete here:
 
-Claims v0 claim:
+| Model | All fields |
+| --- | --- |
+| `SemanticField` | `value*`, `entity_type?`, `ontology?` |
+| `OntologyAnnotation` | `annotation_type*` (`mapping`/`classification`), `raw_text?`, `normalized_text?`, `mapping_status*` (`mapped`/`ambiguous`/`unresolved`/`rejected`), `candidate_mappings=[]`, `selected_mapping?`, `mapping_method?` |
+| `OntologyCandidate` | `ontology_source*`, `ontology_id*`, `ontology_label*`, `match_type?`, `confidence?` |
 
-```json
-{
-  "claim_id": "C01",
-  "paper_id": "paper1",
-  "claim_text": "Treatment A reduced median recovery time.",
-  "subject": {"value": "Treatment A"},
-  "predicate": {"value": "reduced"},
-  "object": {"value": "median recovery time"},
-  "claim_kind": "result",
-  "epistemic_status": "supported",
-  "support_origin": "paper",
-  "source_span_ids": ["paper1-span-0001"],
-  "details": {}
-}
-```
+The flat model defaults `context` and `details` to empty objects, while section-context prompts and profile gating impose stronger extraction rules. The Agent model requires the *presence* of `conditions` and `falsification_criteria` strings; its separate deterministic validator also flags empty values and unresolved proof/evidence references. The status vocabularies should not be mapped by name alone.
 
-Claims Agent claim, from the Codex Rietveld run:
+## Stage 5 — Evidence, links, experiments, concepts
 
-```json
-{
-  "claim_id": "C01",
-  "statement": "Large-scale meta-analysis can identify replicable genetic loci for educational attainment where smaller social-science genetics studies had not produced consistent hits.",
-  "conditions": "Supported for the harmonized EduYears and College phenotypes in the discovery and replication cohorts described in the provided source; not a claim that the same loci generalize across ancestries or all educational systems.",
-  "status": "supported",
-  "falsification_criteria": "The claim would be weakened if independent replication under the same phenotype definitions failed for the three genome-wide significant loci or if the reported replication were attributable to unmodeled cohort artifacts.",
-  "proof": ["E01", "E02"],
-  "evidence_ids": ["EV01", "EV02"],
-  "dependencies": [],
-  "sources": [
-    {
-      "source_id": "S01",
-      "source_type": "span",
-      "path": null,
-      "span_ids": ["Rietveld_et_al_2013_Science-p001-001"],
-      "quote": "Three independent single-nucleotide polymorphisms (SNPs) are genome-wide significant",
-      "role": "result"
-    },
-    {
-      "source_id": "S02",
-      "source_type": "span",
-      "path": null,
-      "span_ids": ["Rietveld_et_al_2013_Science-p001-001"],
-      "quote": "all three replicate",
-      "role": "result"
-    },
-    {
-      "source_id": "S03",
-      "source_type": "span",
-      "path": null,
-      "span_ids": ["Rietveld_et_al_2013_Science-p001-001"],
-      "quote": "discovery sample of 101,069 individuals and a replication sample of 25,490",
-      "role": "method"
-    }
-  ],
-  "source_claim_id": null,
-  "metadata": {
-    "phenotypes": ["EduYears", "College"],
-    "replicated_snps": ["rs9320913", "rs11584700", "rs4851266"]
-  }
-}
-```
+| Meaning | `section_context_v1` | `agent_v1` |
+| --- | --- | --- |
+| Evidence location | `evidence_items[]: EvidenceItem` | `evidence.records[]: EvidenceRecord` |
+| Identity | `evidence_id*`, `paper_id*` | `evidence_id*`, `title*` |
+| Role and summary | `role*`, `summary_text*` | `role*`, `summary*` |
+| Method | `evidence_method*` (`SemanticField`) | `evidence_method=""` (string) |
+| Result and format | `outcome_type?`, `presentation_type?` (`SemanticField`) | `outcome_type?`, `presentation_type?` (strings) |
+| Qualifiers | `context={}` (`SemanticField` map), `details={}`, `ontology?` | `metadata={}`; no typed context/details/ontology slots |
+| Provenance | `source_span_ids=[]` | `source_refs=[]` (`SourceRef[]`) |
+| Claim relation | Separate `claim_evidence_links[]` | `linked_claim_ids=[]` plus claim `evidence_ids=[]` |
+| Ledger | No dedicated ledger notes | `evidence.ledger_notes=[]` |
 
-The Agent claim carries the statement plus the context needed to judge it:
-conditions, falsification criteria, proof experiment IDs, evidence IDs, and
-source refs. On claims, the field is named `sources`; each item has the shared
-`SourceRef` shape.
+Every flat `ClaimEvidenceLink` contains `link_id*`, `claim_id*`, `evidence_id*`, `relation*`, `confidence?`. Agent v1 references claims and evidence by ID, but has **no link-level `relation` or `confidence` field**.
 
-## Evidence Example
+Agent `logic.experiments[]` contains `Experiment`: `experiment_id*`, `title*`, `verifies=[]` (claim IDs), `setup*`, `procedure*`, `expected_outcome*`, `evidence_ids=[]`, `run?`, `source_refs=[]`. Agent claim `proof[]` points to experiment IDs; claim `evidence_ids[]` points to evidence record IDs. Agent `logic.concepts[]` contains `Concept`: `concept_id*`, `label*`, `definition*`, `source_refs=[]`. Section context has neither first-class experiments nor a concept list.
 
-Claims v0 evidence:
+## Stage 6 — Provenance, trace, and runtime
 
-```json
-{
-  "evidence_id": "EV01",
-  "paper_id": "paper1",
-  "role": "support",
-  "summary_text": "Median recovery time was lower in the treatment group.",
-  "evidence_method": {"value": "observation", "entity_type": "evidence_method"},
-  "outcome_type": {"value": "recovery time", "entity_type": "outcome_type"},
-  "presentation_type": {"value": "text", "entity_type": "presentation_type"},
-  "source_span_ids": ["paper1-span-0001"],
-  "details": {}
-}
-```
+| `section_context_v1` | `agent_v1` |
+| --- | --- |
+| Claims and evidence use `source_span_ids[]`; `artifact.json → spans[]` supplies source text. | `SourceRef`: `source_id*`, `source_type*`, `path?`, `span_ids=[]`, `quote?`, `role="input"`. Allowed roles: `input`, `result`, `method`, `interpretation`, `metadata`. Claims use `sources[]`; evidence, concepts, experiments, and trace use `source_refs[]`. |
+| `section_extraction_plan[]` records section choice; `raw_section_outputs[]` records selected extraction calls. | `trace: TraceNode*` is recursive: `node_id*`, `node_type*`, `support_level="inferred"` (`explicit`/`inferred`), `summary*`, `source_refs=[]`, `evidence=[]` (IDs), `children=[]` (`TraceNode[]`). The materializer may insert a placeholder trace if the runtime omits one. |
+| Main output has no `metadata` field. `artifact.json.metadata={}` belongs to the input artifact; `manifest.json` holds run counts and paths. | `metadata={}` is part of `agent_output.json`. The runner adds `pipeline_name`, `output_schema`, `runtime`, `runtime_metrics`, `skill_name`, `skill_sha256`, `source_type`, `source_path`, and `source_metadata`. These are runtime values, not fixed Pydantic fields. |
+| No source/artifact layer in the main output. | `src.environment=[]`, `src.artifacts=[]` are string lists; `ara_version="1.0"` labels the artifact layout. |
 
-Claims Agent evidence, from the Codex Rietveld run:
+For completeness, Agent `Logic` has `problem_observations=[]`, `gaps=[]`, `key_insight=""`, `assumptions=[]`, `claims=[]`, `concepts=[]`, `experiments=[]`, `related_work=[]`, `constraints=[]`. `EvidenceLayer` has `records=[]`, `ledger_notes=[]`. Root `paper`, `logic`, `evidence`, `trace`, and `src` are required by `Artifact`, although the runner materializer can supply several missing layers before model validation.
 
-```json
-{
-  "evidence_id": "EV01",
-  "title": "Discovery-stage significant loci",
-  "role": "metadata",
-  "summary": "The discovery-stage GWAS found one genome-wide significant EduYears locus and two genome-wide significant College loci, plus additional suggestive loci.",
-  "evidence_method": "GWAS meta-analysis across discovery cohorts",
-  "outcome_type": "association_result",
-  "presentation_type": "text",
-  "source_refs": [
-    {
-      "source_id": "S31",
-      "source_type": "span",
-      "path": null,
-      "span_ids": ["Rietveld_et_al_2013_Science-p001-001"],
-      "quote": "one genome-wide–significant locus",
-      "role": "result"
-    }
-  ],
-  "linked_claim_ids": ["C01"],
-  "metadata": {
-    "table": "Table 1"
-  }
-}
-```
+## Practical mapping and gaps
 
-The Agent evidence record keeps the support role, method, outcome, presentation
-type, linked claims, and source refs together.
+| Section-context source | Agent destination | What needs care |
+| --- | --- | --- |
+| `paper.paper_id`, `title`, `authors`, `year`, `doi`, `journal` | Same names except `journal → venue` | `pmid`, `source_type`, and `open_access` need metadata if retained. |
+| `claims[].claim_text` | `logic.claims[].statement` | Agent `conditions` and `falsification_criteria` need interpretation or fresh extraction. |
+| `subject`, `predicate`, `object`, `claim_profile`, `context`, `details` | No dedicated Agent equivalents; possibly `conditions` or `metadata` | A simple text copy loses typed relation, profile rules, and ontology. |
+| `evidence_items[].summary_text` | `evidence.records[].summary` | Agent `title` must be supplied. `SemanticField.value` can seed method/outcome/presentation strings, but qualifiers and ontology need explicit preservation. |
+| `claim_evidence_links[]` | `evidence_ids[]`, `linked_claim_ids[]` | Link `relation` and `confidence` have no dedicated destination; keep both ID directions consistent. |
+| `source_span_ids[]` plus source `spans[]` | `SourceRef.span_ids[]`, optional `quote` | Look up source text to populate a quote and role; a span ID alone does not provide them. |
+| Summaries and section plan | No one-to-one destination | Preserve as provenance if needed; a section selection decision is not an Agent trace node. |
 
-## Experiment Example
-
-Claims v0 has no first-class experiment or proof object. The closest information
-usually lives in claim/evidence details.
-
-The Agent schema has `logic.experiments[]`. From the Codex Rietveld run:
-
-```json
-{
-  "experiment_id": "E01",
-  "title": "Discovery-stage GWAS meta-analysis",
-  "verifies": ["C01"],
-  "setup": "Meta-analyze cohort-level GWAS results for EduYears and College across the discovery cohorts under a prespecified analysis plan.",
-  "procedure": "Harmonize phenotypes, impute to HapMap 2 CEU, control principal components, quality-control cohort results, and meta-analyze at independent centers.",
-  "expected_outcome": "Genome-wide significant or suggestive loci should emerge if common variants are associated with the phenotypes.",
-  "evidence_ids": ["EV01"],
-  "run": "Discovery meta-analysis across 42 cohorts",
-  "source_refs": [
-    {
-      "source_id": "S25",
-      "source_type": "span",
-      "path": null,
-      "span_ids": ["Rietveld_et_al_2013_Science-p001-001"],
-      "quote": "meta-analysis was performed across 42 cohorts",
-      "role": "method"
-    }
-  ]
-}
-```
-
-This is the main reason claim `proof[]` uses experiment IDs while
-`evidence_ids[]` uses evidence record IDs.
-
-## Concept Example
-
-Claims v0 has semantic fields on claims and evidence, but no separate concept
-layer. The Agent schema has `logic.concepts[]`. From the Codex Rietveld run:
-
-```json
-{
-  "concept_id": "K01",
-  "label": "Educational attainment",
-  "definition": "The study phenotype, harmonized as EduYears and College completion across cohorts.",
-  "source_refs": [
-    {
-      "source_id": "S19",
-      "source_type": "span",
-      "path": null,
-      "span_ids": ["Rietveld_et_al_2013_Science-p001-001"],
-      "quote": "years of schooling",
-      "role": "method"
-    }
-  ]
-}
-```
-
-## Source Grounding
-
-Claims v0 usually grounds objects with span IDs:
-
-```json
-{
-  "source_span_ids": ["paper1-span-0001"]
-}
-```
-
-The Agent schema uses `SourceRef` objects. Claims store them in `sources[]`;
-evidence records, concepts, experiments, and trace nodes store them in
-`source_refs[]`:
-
-```json
-{
-  "source_id": "S01",
-  "source_type": "span",
-  "path": null,
-  "span_ids": ["Rietveld_et_al_2013_Science-p001-001"],
-  "quote": "Three independent single-nucleotide polymorphisms (SNPs) are genome-wide significant",
-  "role": "result"
-}
-```
-
-Source refs are more expressive. They can preserve the exact quote and explain
-whether the cited source is an input, method, result, interpretation, or
-metadata source.
-
-## Trace Example
-
-The Agent schema also includes a reasoning or exploration trace. From the Codex
-Rietveld run:
-
-```json
-{
-  "node_id": "Q0",
-  "node_type": "question",
-  "support_level": "inferred",
-  "summary": "Can a very large GWAS meta-analysis identify reliable genetic associations for educational attainment and clarify the architecture of the trait?",
-  "source_refs": [
-    {
-      "source_id": "S40",
-      "source_type": "span",
-      "path": null,
-      "span_ids": ["Rietveld_et_al_2013_Science-p001-001"],
-      "quote": "complex behavioral trait—educational attainment",
-      "role": "method"
-    }
-  ],
-  "evidence": ["C01", "C02", "C03", "C04", "C05", "C06"],
-  "children": [
-    {
-      "node_id": "N01",
-      "node_type": "experiment",
-      "support_level": "explicit",
-      "summary": "Run discovery-stage GWAS meta-analysis across many cohorts for EduYears and College.",
-      "source_refs": [
-        {
-          "source_id": "S41",
-          "source_type": "span",
-          "path": null,
-          "span_ids": ["Rietveld_et_al_2013_Science-p001-001"],
-          "quote": "GW AS meta-analysis was performed across 42 cohorts",
-          "role": "method"
-        }
-      ],
-      "evidence": ["E01", "EV01"],
-      "children": []
-    }
-  ]
-}
-```
-
-## What We Are Adopting
-
-For new miner and validator work, we are adopting the Claims Agent schema as the
-canonical contract.
-
-That means:
-
-- miners should produce `agent_output.json`
-- validators should validate the Agent schema directly
-- rigor checks should understand the Agent schema's logic/evidence/trace layers
-- runtime metrics should live in `metadata.runtime_metrics` when available
-- docs should describe v0 as the older Claims schema, not the schema new work
-  should target
-
-The adoption is not a rejection of v0's core idea. Both schemas are about
-source-grounded scientific claims. The Agent schema keeps that foundation and
-adds the structure we need for agentic extraction, richer validation, and future
-benchmarking across agent backends.
+This table is a mapping guide, **not a lossless converter**. Section context favors section-local typed claim packets and explicit relation rows. Agent v1 adds claim conditions and falsification criteria, experiments, concepts, an exploration tree, and source-reference objects. Converting a file cannot manufacture those research judgments.

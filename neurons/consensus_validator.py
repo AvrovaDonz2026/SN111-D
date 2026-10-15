@@ -205,7 +205,8 @@ class ClaimsConsensusValidator:
                 validator_failed_hotkeys=[],
             )
             self.bt_logging.info(
-                f"Completed expired consensus round={round_id} responses=0/{len(assignments)} "
+                f"Finalized expired consensus round={round_id} status={completed.get('status')} "
+                f"responses=0/{len(assignments)} "
                 f"outcomes={len((completed.get('result') or {}).get('outcomes') or [])}"
             )
             return
@@ -301,7 +302,8 @@ class ClaimsConsensusValidator:
         finalize_seconds = time.perf_counter() - finalize_started
         process_seconds = time.perf_counter() - process_started
         self.bt_logging.info(
-            f"Completed consensus round={round_id} responses={len(submissions)}/{len(assignments)} "
+            f"Finalized consensus round={round_id} status={completed.get('status')} "
+            f"responses={len(submissions)}/{len(assignments)} "
             f"outcomes={len((completed.get('result') or {}).get('outcomes') or [])} "
             f"query_seconds={query_seconds:.3f} finalize_seconds={finalize_seconds:.3f} "
             f"process_seconds={process_seconds:.3f}"

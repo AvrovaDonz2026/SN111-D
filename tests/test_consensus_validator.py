@@ -293,7 +293,7 @@ def test_expired_round_completes_without_querying_reviewers() -> None:
     class _Backend:
         def complete_miner_consensus_round(self, **kwargs):
             completed.append(kwargs)
-            return {"result": {"outcomes": []}}
+            return {"status": "completed", "result": {"outcomes": []}}
 
     validator = ClaimsConsensusValidator.__new__(ClaimsConsensusValidator)
     validator.metagraph = SimpleNamespace(neurons=[])
@@ -327,7 +327,7 @@ def test_expired_round_completes_without_querying_reviewers() -> None:
             "validator_failed_hotkeys": [],
         }
     ]
-    assert any("Completed expired consensus round" in message for message in validator.bt_logging.messages)
+    assert any("Finalized expired consensus round=round_expired status=completed" in message for message in validator.bt_logging.messages)
 
 
 def test_confirmed_source_failure_voids_only_affected_reviewer(monkeypatch) -> None:

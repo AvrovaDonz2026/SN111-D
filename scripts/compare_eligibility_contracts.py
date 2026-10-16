@@ -62,12 +62,14 @@ def summarize(events):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--env-file", type=Path, required=True)
-    parser.add_argument("--bronze-artifact", type=Path, required=True)
-    parser.add_argument("--source-payload", type=Path, required=True)
-    parser.add_argument("--miner-artifact", type=Path, required=True)
+    parser.add_argument("--fixture-file", type=Path, help="Normalized, validated context fixture, including multiple miners.")
+    parser.add_argument("--bronze-artifact", type=Path)
+    parser.add_argument("--source-payload", type=Path)
+    parser.add_argument("--miner-artifact", type=Path)
     parser.add_argument("--miner-id", default="uid_2")
-    parser.add_argument("--case-file", type=Path, required=True)
+    parser.add_argument("--case-file", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--validate-only", action="store_true", help="Validate and fingerprint the fixture without model requests.")
     parser.add_argument(
         "--case-limit",
         type=int,
@@ -84,43 +86,71 @@ def main():
     if (args.output_dir / "comparison.json").exists():
         parser.error("Use a new output directory; comparison.json already exists.")
     load_dotenv(args.env_file, override=True)
-    source = read(args.source_payload)
-    bronze = read(args.bronze_artifact)
-    miner = read(args.miner_artifact)
-    case_data = read(args.case_file)
-    candidates = [
-        *project_agent_artifact(bronze, origin="bronze"),
-        *project_agent_artifact(miner, origin="miner", miner_id=args.miner_id),
-    ]
-    by_id = {c.candidate_id: c for c in candidates}
-    cases = [BronzeDiffCase.model_validate(c) for c in case_data["diff_cases"]]
-    if args.case_limit:
-        cases = cases[: args.case_limit]
-    if not cases:
-        parser.error("Fixture has no eligibility cases.")
-    missing = {ref for case in cases for ref in case.candidate_ids if ref not in by_id}
-    if missing:
-        parser.error(f"Candidate identities cannot be recovered: {sorted(missing)}")
-    paper_id = cases[0].paper_id
-    if any(case.paper_id != paper_id for case in cases):
-        parser.error("Use a single paper fixture.")
-    source_map = {
-        s["span_id"]: s["text"]
-        for s in source["spans"]
-        if s.get("span_id") and s.get("text")
-    }
-    contexts = [
-        AdjudicationContextBundle(
-            case=case,
-            candidates=[by_id[c] for c in case.candidate_ids],
-            source_context="\n".join(
-                source_map.get(s, "")
-                for c in case.candidate_ids
-                for s in by_id[c].source_span_ids
-            ),
-        )
-        for case in cases
-    ]
+    if args.fixture_file:
+        saved = read(args.fixture_file)
+        contexts = [AdjudicationContextBundle.model_validate(c) for c in saved["contexts"]]
+        if args.case_limit:
+            contexts = contexts[:args.case_limit]
+        if not contexts:
+            parser.error("Fixture has no eligibility cases.")
+        cases = [c.case for c in contexts]
+        paper_id = cases[0].paper_id
+        if any(c.paper_id != paper_id for c in cases):
+            parser.error("Use a single paper fixture.")
+        source_map = saved["source_spans"]
+        by_id = {c.candidate_id: c for bundle in contexts for c in bundle.candidates}
+        candidates = list(by_id.values())
+        source = {"paper": saved.get("paper_context", {})}
+        bronze = {}
+    else:
+        if not all([args.source_payload, args.bronze_artifact, args.miner_artifact, args.case_file]):
+            parser.error("Supply --fixture-file or all four raw artifact paths.")
+        source = read(args.source_payload)
+        bronze = read(args.bronze_artifact)
+        miner = read(args.miner_artifact)
+        case_data = read(args.case_file)
+        candidates = [
+            *project_agent_artifact(bronze, origin="bronze"),
+            *project_agent_artifact(miner, origin="miner", miner_id=args.miner_id),
+        ]
+        by_id = {c.candidate_id: c for c in candidates}
+        cases = [BronzeDiffCase.model_validate(c) for c in case_data["diff_cases"]]
+        if args.case_limit:
+            cases = cases[: args.case_limit]
+        if not cases:
+            parser.error("Fixture has no eligibility cases.")
+        missing = {ref for case in cases for ref in case.candidate_ids if ref not in by_id}
+        if missing:
+            parser.error(f"Candidate identities cannot be recovered: {sorted(missing)}")
+        paper_id = cases[0].paper_id
+        if any(case.paper_id != paper_id for case in cases):
+            parser.error("Use a single paper fixture.")
+        source_map = {
+            s["span_id"]: s["text"]
+            for s in source["spans"]
+            if s.get("span_id") and s.get("text")
+        }
+        contexts = [
+            AdjudicationContextBundle(
+                case=case,
+                candidates=[by_id[c] for c in case.candidate_ids],
+                source_context="\n".join(
+                    source_map.get(s, "")
+                    for c in case.candidate_ids
+                    for s in by_id[c].source_span_ids
+                ),
+            )
+            for case in cases
+        ]
+    if len({c.case_id for c in cases}) != len(cases):
+        parser.error("Duplicate case identifiers in fixture.")
+    for bundle in contexts:
+        if set(bundle.case.candidate_ids) != {c.candidate_id for c in bundle.candidates}:
+            parser.error(f"Candidate identity mismatch: {bundle.case.case_id}")
+        for candidate in bundle.candidates:
+            missing_spans = set(candidate.source_span_ids) - source_map.keys()
+            if missing_spans:
+                parser.error(f"Candidate source spans missing: {candidate.candidate_id}: {sorted(missing_spans)}")
     fixture = {
         "paper_id": paper_id,
         "contexts": [c.model_dump(mode="json") for c in contexts],
@@ -131,6 +161,9 @@ def main():
     ).hexdigest()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     (args.output_dir / "fixture.json").write_text(json.dumps(fixture, indent=2))
+    if args.validate_only:
+        print(f"Validated {paper_id}: {len(cases)} cases, fixture {fingerprint}")
+        return 0
     config = FileAgentWorkflowConfig.from_env()
     report = {
         "created_at": datetime.now(timezone.utc).isoformat(),

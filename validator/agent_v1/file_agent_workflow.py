@@ -283,6 +283,8 @@ class FileAgentWorkflowConfig:
     adjudication_negative_model: str = ""
     adjudication_positive_model: str = ""
     adjudication_tiebreak_model: str = ""
+    eligibility_output_contract: str = "verbose"
+    eligibility_sample_verbose_paper: bool = True
     adjudication_batch_size: int = 4
     adjudication_max_source_chars: int = 30000
     adjudication_max_workers: int = 4
@@ -301,6 +303,8 @@ class FileAgentWorkflowConfig:
     resume_existing_stages: bool = False
 
     def __post_init__(self) -> None:
+        if self.eligibility_output_contract not in {"verbose", "compact"}:
+            raise ValueError("Eligibility output contract must be verbose or compact.")
         if self.canonicalization_harness not in {"file-agent", "dspy"}:
             raise ValueError("Canonicalization harness must be file-agent or dspy.")
         if self.adjudication_harness not in {"file-agent", "dspy"}:
@@ -418,6 +422,8 @@ class FileAgentWorkflowConfig:
                 "CLAIMS_SILVER_ADJUDICATION_TIEBREAK_MODEL",
                 tiebreak_model,
             ).strip(),
+            eligibility_output_contract=os.getenv("CLAIMS_ELIGIBILITY_OUTPUT_CONTRACT", "compact").strip().lower(),
+            eligibility_sample_verbose_paper=os.getenv("CLAIMS_ELIGIBILITY_SAMPLE_VERBOSE_PAPER", "true").strip().lower() in {"true", "1", "yes", "on"},
             adjudication_batch_size=max(
                 1,
                 int(os.getenv("CLAIMS_SILVER_ADJUDICATION_BATCH_SIZE", "4") or 4),
@@ -573,6 +579,7 @@ class FileAgentWorkflowSession:
             "eligibility_adjudication/decisions.json",
             {
                 "schema": "claims_silver_eligibility_adjudication_v2",
+                "output_contract": self.config.eligibility_output_contract,
                 "eligibility_profile_id": ELIGIBILITY_PROFILE_ID,
                 "case_count": len(contexts),
                 "single_case_count": sum(len(context.candidates) == 1 for context in contexts),
@@ -591,6 +598,9 @@ class FileAgentWorkflowSession:
         *,
         batch_index: int,
     ) -> list[EligibilityAdjudicationDecision]:
+        if self.config.eligibility_output_contract == "compact":
+            from .eligibility_compact import run_compact_batch
+            return run_compact_batch(self, contexts, batch_index=batch_index)
         stage_suffix = "" if batch_index == 0 else f"_b{batch_index:03d}"
         source_map = (
             self.eligibility_source_context_by_span_id

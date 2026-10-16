@@ -26,6 +26,7 @@ from dotenv import load_dotenv
 from miner.agent_v1.ingest import PDF_READERS
 from miner.agent_v1.provider import provider_api_key_env
 from validator.agent_v1.adjudication_config import SilverAdjudicationConfig, build_silver_adjudication_passes
+from validator.agent_v1.eligibility_compact import candidate_findings, sampled_verbose_paper
 from validator.agent_v1.artifact_summary import summarize_agent_artifact
 from validator.agent_v1.batch_scoring import score_batch, winner_takes_most_weights
 from validator.agent_v1.comparison_models import SilverScoreBreakdown
@@ -3212,6 +3213,15 @@ class ClaimsValidator:
                 setup_failure = ("silver_setup", f"{type(exc).__name__}: {exc}")
                 self.bt_logging.warning(f"Silver post-pass setup failed: {setup_failure[1]}")
 
+        verbose_sample = None
+        if (file_agent_workflow is not None
+                and file_agent_workflow.config.eligibility_output_contract == "compact"
+                and file_agent_workflow.config.eligibility_sample_verbose_paper):
+            verbose_sample = sampled_verbose_paper(
+                task.batch_id or task.task_id,
+                [paper.paper_id or f"paper_{index}" for index, paper in paper_jobs],
+            )
+
         def process_paper(paper_index: int, paper: ClaimsPaperTask) -> _PaperSilverPostPassResult:
             paper_id = paper.paper_id or f"paper_{paper_index}"
             miner_rows = miners_by_paper.get(paper_id, [])
@@ -3346,7 +3356,12 @@ class ClaimsValidator:
                         )
                         or 0
                     ),
-                    file_agent_workflow=file_agent_workflow,
+                    file_agent_workflow=(
+                        replace(file_agent_workflow, config=replace(
+                            file_agent_workflow.config, eligibility_output_contract="verbose"))
+                        if paper_id == verbose_sample and file_agent_workflow is not None
+                        else file_agent_workflow
+                    ),
                 )
                 score_rows = _scores_with_missing_miners(
                     paper_id=paper_id,
@@ -3542,6 +3557,12 @@ class ClaimsValidator:
             reward_exclusions=duplicate_exclusion_reasons,
         )
         batch_payload = batch_result.model_dump(mode="json")
+        batch_payload["eligibility_output_sampling"] = {
+            "output_contract": file_agent_workflow.config.eligibility_output_contract if file_agent_workflow else "legacy",
+            "verbose_paper_id": verbose_sample,
+            "method": "batch_paper_hash_v1",
+            "sample_scored": verbose_sample in eligible_paper_ids if verbose_sample else None,
+        }
         batch_payload["duplicate_submission_detection"] = duplicate_report
         batch_payload["validator_failed_papers"] = validator_failed_papers
         batch_payload["scored_paper_count"] = len(eligible_paper_ids)
@@ -4072,7 +4093,11 @@ class ClaimsValidator:
                     "candidate_ids": case.candidate_ids,
                     "status": "pending",
                     "context_uri": f"claims-api:/runs/{run_id}/papers/{safe_task_id(paper_id)}/adjudication-consensus",
-                    "findings": [],
+                    "findings": candidate_findings(
+                        [*result.bronze_candidates, *[
+                            candidate for submission in result.miner_submissions
+                            for candidate in submission.candidates
+                        ]], case.candidate_ids),
                     "decision": {"case": case_payload},
                 }
             )

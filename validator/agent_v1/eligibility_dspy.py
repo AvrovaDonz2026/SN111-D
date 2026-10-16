@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field, create_model
 from miner.agent_v1.provider import dspy_model_id, normalize_provider
 from miner.agent_v1.runtime.usage import empty_usage, usage_from_dspy_lm
 
+from .eligibility_compact import (CompactEligibilityOutput, CompactVerdict, CompactBlindOutput, CompactBlindFinding)
 from .model_usage import UsageSink
 from .eligibility import (
     ELIGIBILITY_GATES,
@@ -142,6 +143,7 @@ class DSPyEligibilityRuntime:
                         "metadata": {
                             "workflow": "eligibility_adjudication",
                             "workspace_id": workspace_id,
+                            "output_contract": (task.get("output_contract") or {}).get("version", "verbose"),
                         },
                     }
                 )
@@ -235,6 +237,29 @@ def _constrained_output_model(
         )
     ).hexdigest()[:10]
     span_type = _literal_type(source_refs)
+    if issubclass(output_model, CompactEligibilityOutput):
+        verdict = create_model(
+            f"DSPyCompactVerdict_{suffix}", __base__=CompactVerdict,
+            span_ids=(list[span_type], ...),
+        )
+        cases_model = create_model(
+            f"DSPyCompactCases_{suffix}",
+            __config__={"extra": "forbid"},
+            **{ref: (verdict, ...) for ref in case_refs},
+        )
+        return create_model(
+            f"DSPyCompactOutput_{suffix}", __base__=CompactEligibilityOutput,
+            decisions=(cases_model, ...),
+        )
+    if issubclass(output_model, CompactBlindOutput):
+        finding = create_model(
+            f"DSPyCompactBlindFinding_{suffix}", __base__=CompactBlindFinding,
+            span_ids=(list[span_type], Field(min_length=1)),
+        )
+        return create_model(
+            f"DSPyCompactBlindOutput_{suffix}", __base__=CompactBlindOutput,
+            findings=(list[finding], ...),
+        )
     if issubclass(output_model, EligibilityBlindReconstructionOutput):
         finding_model = create_model(
             f"DSPyEligibilityBlindFinding_{suffix}",

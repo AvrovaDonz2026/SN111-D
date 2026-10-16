@@ -1248,7 +1248,9 @@ def test_neuron_silver_post_pass_counts_all_miner_missing_paper_as_zero(tmp_path
     }
 
 
-def test_neuron_silver_post_pass_parallelizes_batch_papers(monkeypatch, tmp_path) -> None:
+@pytest.mark.parametrize("compact", [False, True])
+def test_neuron_silver_post_pass_parallelizes_batch_papers(monkeypatch, tmp_path, compact) -> None:
+    observed_contracts = {}
     bronze_root = tmp_path / "bronze"
     started_count = 0
     started_lock = threading.Lock()
@@ -1278,6 +1280,8 @@ def test_neuron_silver_post_pass_parallelizes_batch_papers(monkeypatch, tmp_path
 
     def fake_pipeline(*, paper_id, silver_record_id, bronze_record_id, **_kwargs):
         nonlocal started_count
+        workflow = _kwargs.get("file_agent_workflow")
+        observed_contracts[paper_id] = workflow.config.eligibility_output_contract if workflow else "legacy"
         with started_lock:
             started_count += 1
             if started_count == 2:
@@ -1336,6 +1340,12 @@ def test_neuron_silver_post_pass_parallelizes_batch_papers(monkeypatch, tmp_path
     validator.target_neurons = [SimpleNamespace(uid=7, hotkey="hotkey7", coldkey="coldkey7", axon_info=SimpleNamespace(ip="", port=0, hotkey=""))]
     validator._active_run_timing = None
     validator._build_reference_miner_client = lambda: FakeBronzeClient()  # type: ignore[method-assign]
+    if compact:
+        from validator.agent_v1.file_agent_workflow import FileAgentSilverWorkflow, FileAgentWorkflowConfig
+        workflow = FileAgentSilverWorkflow(config=FileAgentWorkflowConfig(
+            root=tmp_path, harness="hermes-cli", provider="openrouter",
+            comparison_model="model", canonicalization_model="model", eligibility_output_contract="compact"))
+        validator._build_silver_file_agent_workflow = lambda _passes: workflow
     response = SimpleNamespace(
         protocol_version="claims.v0",
         schema_version="miner.v0.section_context_compat",
@@ -1359,6 +1369,12 @@ def test_neuron_silver_post_pass_parallelizes_batch_papers(monkeypatch, tmp_path
 
     assert started_count == 2
     assert scores == {7: 1.0}
+
+    if compact:
+        assert sorted(observed_contracts.values()) == ["compact", "verbose"]
+        sampling = validator._active_silver_batch_outcome["eligibility_output_sampling"]
+        assert observed_contracts[sampling["verbose_paper_id"]] == "verbose"
+        assert sampling["sample_scored"] is True
 
 
 def test_neuron_silver_post_pass_fails_when_every_processable_paper_fails(monkeypatch, tmp_path) -> None:

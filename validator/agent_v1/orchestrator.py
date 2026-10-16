@@ -397,9 +397,14 @@ def run_paper_silver_pipeline(
             for candidate_id in decision.rejected_candidate_ids
         },
     )
+    from .eligibility_compact import candidate_findings
+    for decision in eligibility_adjudication_decisions:
+        case = next(case for case in diff_cases if case.case_id == decision.case_id)
+        decision.candidate_findings = candidate_findings(all_candidate_pool, case.candidate_ids)
     silver_record.metadata["eligibility_selection_adjudication"] = {
         "schema": "claims_silver_eligibility_adjudication_v2",
         "eligibility_profile_id": ELIGIBILITY_PROFILE_ID,
+        "output_contract": getattr(file_session.config, "eligibility_output_contract", "verbose") if file_session else "verbose",
         "enabled": file_session is not None,
         "case_count": len(eligibility_adjudication_decisions),
         "pair_case_count": sum(len(case.candidate_ids) == 2 for case in diff_cases),

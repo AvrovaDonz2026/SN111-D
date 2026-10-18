@@ -30,7 +30,7 @@ def analyze(root):
     totals = {a: defaultdict(Counter) for a in ["before", "after"]}
     all_attempts = {a: [] for a in ["before", "after"]}
     physical = []
-    rows, paper_rows, common_decisions, partitions = [], [], [], []
+    rows, paper_rows, common_decisions, partitions, group_decisions = [], [], [], [], []
     reliability_counts = {a: Counter() for a in ["before", "after"]}
     for report in reports:
         folder = root / report["paper_id"]
@@ -141,6 +141,26 @@ def analyze(root):
                     "after_reason": b["rationale"],
                 }
             )
+        for group in report["comparison"].get("groups", []):
+            members = set(group["member_candidate_ids"])
+            kept = {
+                arm: sorted(
+                    members.intersection(report["arms"][arm]["retained_candidate_ids"])
+                )
+                for arm in ["before", "after"]
+            }
+            group_decisions.append(
+                {
+                    "paper_id": paper,
+                    "group_id": group["group_id"],
+                    "before_retained_members": kept["before"],
+                    "after_retained_members": kept["after"],
+                    "finding_present_before": bool(kept["before"]),
+                    "finding_present_after": bool(kept["after"]),
+                    "finding_acceptance_changed": bool(kept["before"])
+                    != bool(kept["after"]),
+                }
+            )
         membership = {
             arm: {
                 cid: i
@@ -206,6 +226,7 @@ def analyze(root):
         "candidate_diffs": rows,
         "unchanged_route_decisions": common_decisions,
         "shared_candidate_partition_changes": partitions,
+        "group_decision_changes": group_decisions,
         "interpretation": "Membership changes inside bypassed groups can restore supported contributor provenance; neither agreement nor a completed audit establishes scientific correctness.",
     }
 
@@ -237,6 +258,7 @@ def main():
         "candidate_diffs",
         "unchanged_route_decisions",
         "shared_candidate_partition_changes",
+        "group_decision_changes",
     ]:
         write_csv(args.output_dir / (key + ".csv"), result[key])
     print(

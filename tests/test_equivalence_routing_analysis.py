@@ -39,6 +39,7 @@ def test_shared_comparison_counted_once_physically_and_equally_in_both_arms(tmp_
         arms[arm] = {
             "status": "complete",
             "case_count": int(arm == "before"),
+            "retained_candidate_ids": ids,
             "usage_including_shared_comparison": {
                 "all": {"completion_tokens": output + 5, "total_tokens": output + 205}
             },
@@ -77,6 +78,7 @@ def test_shared_comparison_counted_once_physically_and_equally_in_both_arms(tmp_
     assert result["paired_usage"]["after"]["all"]["completion_tokens"] == 15
     assert result["papers"][0]["changed_group_members"] == 1
     assert result["papers"][0]["changed_other_candidates"] == 0
+    assert result["group_decision_changes"][0]["finding_acceptance_changed"] is False
 
 
 def test_failed_paper_costs_remain_visible_and_do_not_enter_paired_savings(tmp_path):

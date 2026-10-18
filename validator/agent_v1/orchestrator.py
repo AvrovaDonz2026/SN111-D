@@ -11,7 +11,7 @@ from typing import Callable, Iterable
 from .adjudication_models import AdjudicationConsensus, AdjudicationContextBundle, AdjudicationDecision, AdjudicationVote
 from .adjudication_runner import AdjudicationPass, run_adjudication_cases
 from .batch_scoring import BatchScoreResult, score_batch
-from .comparison_models import BronzeDiffCase, CandidatePairEdge, ComparisonCandidate, SilverRecord, SilverScoreBreakdown
+from .comparison_models import BronzeDiffCase, CandidatePairEdge, ComparisonCandidate, EquivalenceGroup, SilverRecord, SilverScoreBreakdown
 from .eligibility import (
     ELIGIBILITY_PROFILE_ID,
     EligibilityAdjudicationDecision,
@@ -73,6 +73,7 @@ class PaperSilverPipelineResult:
         default_factory=list
     )
     stage_timings: list[dict] = field(default_factory=list)
+    equivalence_groups: list[EquivalenceGroup] = field(default_factory=list)
 
 
 def run_paper_silver_pipeline(
@@ -205,11 +206,27 @@ def run_paper_silver_pipeline(
         if file_session is not None
         else _comparison_cases_from_graph
     )
+    equivalence_groups = (
+        list(getattr(file_session, "confirmed_equivalence_groups", []))
+        if comparison_mode == "file_agent" else []
+    )
+    pending_equivalent_ids = {
+        candidate_id for group in equivalence_groups for candidate_id in group.member_candidate_ids
+    }
     diff_cases = case_builder(
         paper_id=paper_id,
-        bronze_candidates=comparison_bronze_candidates,
-        miner_submissions=comparison_miner_submissions,
-        candidate_graph_edges=candidate_graph_edges,
+        bronze_candidates=[candidate for candidate in comparison_bronze_candidates
+                           if candidate.candidate_id not in pending_equivalent_ids],
+        miner_submissions=[
+            MinerPaperSubmission(
+                miner_id=submission.miner_id, paper_id=submission.paper_id,
+                candidates=[candidate for candidate in submission.candidates
+                            if candidate.candidate_id not in pending_equivalent_ids],
+                normal_findings=submission.normal_findings,
+            ) for submission in comparison_miner_submissions
+        ],
+        candidate_graph_edges=[edge for edge in candidate_graph_edges
+                               if not {edge.left_candidate_id, edge.right_candidate_id}.intersection(pending_equivalent_ids)],
     )
     if len(diff_cases) > max_adjudication_cases:
         raise RuntimeError(
@@ -224,6 +241,8 @@ def run_paper_silver_pipeline(
         metadata={
             "filtered_pair_count": sum(len(hits) for hits in comparison_hits.values()),
             "edge_count": len(candidate_graph_edges),
+            "equivalence_group_count": len(equivalence_groups),
+            "bypassed_candidate_count": len(pending_equivalent_ids),
             "case_count": len(diff_cases),
             "workflow": comparison_mode,
         },
@@ -390,13 +409,18 @@ def run_paper_silver_pipeline(
         candidates=all_candidate_pool,
         decisions=decisions,
         equivalent_candidate_groups=equivalent_candidate_groups,
-        excluded_candidate_ids=unresolved_candidate_ids,
+        excluded_candidate_ids=unresolved_candidate_ids | pending_equivalent_ids,
         non_penalized_rejected_candidate_ids={
             candidate_id
             for decision in eligibility_adjudication_decisions
             for candidate_id in decision.rejected_candidate_ids
         },
     )
+    silver_record.metadata["comparison_equivalence_groups"] = {
+        "schema": "claims_comparison_equivalence_groups_v1",
+        "groups": [group.model_dump(mode="json") for group in equivalence_groups],
+        "bypassed_candidate_count": len(pending_equivalent_ids),
+    }
     from .eligibility_compact import candidate_findings
     for decision in eligibility_adjudication_decisions:
         case = next(case for case in diff_cases if case.case_id == decision.case_id)
@@ -422,7 +446,7 @@ def run_paper_silver_pipeline(
                 decisions=decisions,
             )
         except Exception as exc:
-            if not file_session.fallback_to_legacy:
+            if pending_equivalent_ids or not file_session.fallback_to_legacy:
                 raise
             LOGGER.exception("File-agent canonicalization failed for paper=%s; using baseline Silver.", paper_id)
             workflow_fallbacks.append(f"canonicalization:{type(exc).__name__}")
@@ -500,6 +524,7 @@ def run_paper_silver_pipeline(
         silver_record=silver_record,
         scores=scores,
         stage_timings=stage_timings,
+        equivalence_groups=equivalence_groups,
     )
 
 

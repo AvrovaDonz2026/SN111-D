@@ -33,7 +33,7 @@ from .adjudication_passes import (
 from .adjudication_runner import AdjudicationPass
 from .canonicalization_dspy import DSPyCanonicalizationRuntime
 from .comparison_dspy import DSPyComparisonRuntime
-from .comparison_models import CandidatePairEdge, ComparisonCandidate, RelationType, SilverRecord, SilverUnit
+from .comparison_models import CandidatePairEdge, ComparisonCandidate, EquivalenceGroup, RelationType, SilverRecord, SilverUnit
 from .eligibility import (
     ELIGIBILITY_GATES,
     ELIGIBILITY_PROFILE_ID,
@@ -54,6 +54,8 @@ from .eligibility import (
 from .eligibility_dspy import DSPyEligibilityRuntime
 from .model_usage import UsageSink, provider_from_model_or_base
 from .record_projection import normalize_statement
+from .equivalence import confirmed_equivalence_groups, propose_similarity_groups
+from .silver_builder import _candidate_provenance, _candidate_evidence_records
 
 
 LOGGER = logging.getLogger(__name__)
@@ -107,6 +109,7 @@ class ComparisonSubmissionReview(_StrictOutputModel):
 
 class ComparisonAgentOutput(_StrictOutputModel):
     submission_reviews: list[ComparisonSubmissionReview]
+    equivalence_groups: list[list[str]] = Field(default_factory=list)
 
 
 class JudgeResult(_StrictOutputModel):
@@ -272,6 +275,7 @@ class FileAgentWorkflowConfig:
     comparison_model: str
     canonicalization_model: str
     canonical_audit_model: str = ""
+    equivalence_group_bypass: bool = True
     canonicalization_harness: str = "file-agent"
     canonicalization_provider: str = "openrouter"
     canonicalization_api_base: str = "https://openrouter.ai/api/v1"
@@ -377,6 +381,7 @@ class FileAgentWorkflowConfig:
             harness=harness,
             provider=file_agent_provider,
             comparison_model=os.getenv("CLAIMS_SILVER_FILE_AGENT_COMPARISON_MODEL", default_model).strip(),
+            equivalence_group_bypass=os.getenv("CLAIMS_SILVER_EQUIVALENCE_GROUP_BYPASS", "true").strip().lower() in {"true", "1", "yes", "on"},
             canonicalization_model=os.getenv(
                 "CLAIMS_SILVER_FILE_AGENT_CANONICALIZATION_MODEL",
                 default_model,
@@ -516,6 +521,7 @@ class FileAgentWorkflowSession:
     root: Path = field(init=False)
     manifest: dict[str, Any] = field(init=False)
     initial_candidates: list[ComparisonCandidate] = field(init=False)
+    confirmed_equivalence_groups: list[EquivalenceGroup] = field(default_factory=list, init=False)
     _manifest_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -1657,8 +1663,14 @@ class FileAgentWorkflowSession:
             raise
 
     def run_comparison(self) -> list[CandidatePairEdge]:
+        self.confirmed_equivalence_groups = []
+        self._write_json("comparison/equivalence_groups.json", {
+            "schema": "claims_comparison_equivalence_groups_v1",
+            "paper_id": self.paper_id, "workspace_id": self.workspace_id, "groups": [],
+        })
         aliases, candidates_by_alias = _comparison_aliases(self.candidates)
         mandatory_pairs = _exact_reference_submission_pairs(self.candidates, aliases)
+        similarity_groups = propose_similarity_groups(self.candidates)
         task = {
             "paper": self.paper_context,
             "candidates": [
@@ -1666,6 +1678,18 @@ class FileAgentWorkflowSession:
                 for candidate in self.candidates
             ],
             "source_spans": _referenced_source_spans(self.candidates, self.source_context_by_span_id),
+            "provisional_similarity_groups": [
+                [aliases[candidate_id] for candidate_id in group]
+                for group in similarity_groups
+            ],
+            "equivalence_group_instructions": (
+                "Confirm strict equivalence groups across ALL candidates, including miner-only findings. "
+                "Embedding groups are retrieval hints only. Every member must express the same finding, "
+                "population, conditions, outcome, direction and material qualifiers. Check all members "
+                "together; do not use transitive similarity. Return disjoint groups of at least two "
+                "candidate references in equivalence_groups. Omit uncertain groups. This confirms meaning, "
+                "not source support or eligibility. Continue all normal submission relation reviews."
+            ),
             "mandatory_exact_restatement_pairs": [
                 {
                     "reference_candidate_id": reference_alias,
@@ -1858,6 +1882,22 @@ class FileAgentWorkflowSession:
                     },
                 )
             )
+        self.confirmed_equivalence_groups = confirmed_equivalence_groups(
+            paper_id=self.paper_id, candidates=self.candidates, edges=edges,
+            explicit_groups=[
+                [candidates_by_alias[alias].candidate_id for alias in group]
+                for group in output.equivalence_groups
+                if len(set(group)) >= 2 and all(alias in candidates_by_alias for alias in group)
+            ] if not validation.issues else [],
+        )
+        # An incomplete/rejected comparison must never grant an adjudication bypass.
+        if validation.issues or not self.config.equivalence_group_bypass:
+            self.confirmed_equivalence_groups = []
+        self._write_json("comparison/equivalence_groups.json", {
+            "schema": "claims_comparison_equivalence_groups_v1",
+            "paper_id": self.paper_id, "workspace_id": self.workspace_id,
+            "groups": [group.model_dump(mode="json") for group in self.confirmed_equivalence_groups],
+        })
         self._write_json(
             "comparison/comparison_pairs.json",
             {
@@ -2046,14 +2086,31 @@ class FileAgentWorkflowSession:
         decisions: list[AdjudicationDecision],
     ) -> SilverRecord:
         candidates_by_id = {candidate.candidate_id: candidate for candidate in self.candidates}
-        accepted_candidate_ids = sorted(
-            {
-                candidate_id
-                for unit in baseline_record.silver_units
-                for candidate_id in unit.equivalent_candidate_ids
-                if candidate_id in candidates_by_id
-            }
-        )
+        group_artifact = _read_json_value(self.root / "comparison/equivalence_groups.json")
+        pending_groups = []
+        if (self.root / "comparison/equivalence_groups.json").exists() and not isinstance(group_artifact, dict):
+            raise FileAgentWorkflowError("Equivalence artifact is unreadable.")
+        if isinstance(group_artifact, dict):
+            if (group_artifact.get("paper_id") != self.paper_id
+                    or group_artifact.get("workspace_id") != self.workspace_id
+                    or group_artifact.get("schema") != "claims_comparison_equivalence_groups_v1"):
+                raise FileAgentWorkflowError("Equivalence artifact does not match this paper/workspace.")
+            pending_groups = [EquivalenceGroup.model_validate(row) for row in group_artifact.get("groups", [])]
+        pending_ids = {candidate_id for group in pending_groups for candidate_id in group.member_candidate_ids}
+        if not pending_ids.issubset(candidates_by_id):
+            raise FileAgentWorkflowError("Equivalence artifact references unknown candidates.")
+        if sum(len(group.member_candidate_ids) for group in pending_groups) != len(pending_ids):
+            raise FileAgentWorkflowError("Equivalence artifact contains overlapping or duplicate members.")
+        expected_groups = baseline_record.metadata.get("comparison_equivalence_groups")
+        if isinstance(expected_groups, dict) and expected_groups.get("groups", []) != [
+            group.model_dump(mode="json") for group in pending_groups
+        ]:
+            raise FileAgentWorkflowError("Saved equivalence groups do not match comparison routing.")
+        baseline_ids = {
+            candidate_id for unit in baseline_record.silver_units
+            for candidate_id in unit.equivalent_candidate_ids if candidate_id in candidates_by_id
+        }
+        accepted_candidate_ids = sorted(baseline_ids | pending_ids)
         if not accepted_candidate_ids:
             self._write_json(
                 "silver/silver_record.json",
@@ -2067,10 +2124,20 @@ class FileAgentWorkflowSession:
         }
         id_by_alias = {alias: candidate_id for candidate_id, alias in alias_by_id.items()}
         expected_aliases = set(id_by_alias)
+        canonical_source_map = {
+            **(self.eligibility_source_context_by_span_id or {}),
+            **self.source_context_by_span_id,
+        }
+        unresolved_source_ids = {
+            candidate_id for candidate_id in pending_ids
+            if not any(canonical_source_map.get(span_id, "").strip()
+                       for span_id in _eligibility_candidate_span_ids(candidates_by_id[candidate_id]))
+        }
         required_exclusion_aliases = {
             alias_by_id[candidate_id]
             for candidate_id in accepted_candidate_ids
-            if not _candidate_has_linked_evidence(candidates_by_id[candidate_id])
+            if (not _candidate_has_linked_evidence(candidates_by_id[candidate_id])
+                or candidate_id in unresolved_source_ids)
         }
         eligible_candidate_ids = [
             candidate_id
@@ -2078,7 +2145,7 @@ class FileAgentWorkflowSession:
             if alias_by_id[candidate_id] not in required_exclusion_aliases
         ]
         must_link_groups = _canonical_must_link_groups(
-            candidate_ids=eligible_candidate_ids,
+            candidate_ids=[candidate_id for candidate_id in eligible_candidate_ids if candidate_id not in pending_ids],
             candidates_by_id=candidates_by_id,
             decisions=decisions,
         )
@@ -2092,9 +2159,28 @@ class FileAgentWorkflowSession:
                 _canonical_candidate_payload(candidates_by_id[candidate_id], alias_by_id[candidate_id])
                 for candidate_id in accepted_candidate_ids
             ],
-            "source_spans": _referenced_source_spans(
+            "pending_equivalence_groups": [
+                {"group_id": group.group_id,
+                 "candidate_ids": [alias_by_id[candidate_id] for candidate_id in group.member_candidate_ids],
+                 "status": group.status}
+                for group in pending_groups
+            ],
+            "candidate_admission_status": {
+                alias_by_id[candidate_id]: (
+                    "pending_source_support_review" if candidate_id in pending_ids else "adjudicated"
+                ) for candidate_id in accepted_candidate_ids
+            },
+            "pending_candidate_eligibility_gates": list(ELIGIBILITY_GATES) if pending_groups else [],
+            "pending_equivalence_instructions": (
+                "Pending group members have NOT passed eligibility adjudication. Independently check "
+                "each member's statement and linked evidence against source spans and all supplied eligibility "
+                "gates, including original contribution and author-marked salience. Exclude unsupported "
+                "members; another member's evidence must not rescue an invalid submission. "
+                "Groups are comparison judgments, not mandatory merges: split material differences."
+            ),
+            "source_spans": _eligibility_source_spans(
                 [candidates_by_id[candidate_id] for candidate_id in accepted_candidate_ids],
-                self.source_context_by_span_id,
+                canonical_source_map,
             ),
             "adjudication_consensus": [
                 {
@@ -2115,8 +2201,10 @@ class FileAgentWorkflowSession:
             "mandatory_evidence_exclusions": [
                 {
                     "candidate_id": alias,
-                    "reason": _candidate_evidence_ineligibility_reason(
-                        candidates_by_id[id_by_alias[alias]]
+                    "reason": (
+                        "No linked source span resolves to source text for this paper."
+                        if id_by_alias[alias] in unresolved_source_ids
+                        else _candidate_evidence_ineligibility_reason(candidates_by_id[id_by_alias[alias]])
                     ),
                 }
                 for alias in sorted(required_exclusion_aliases)
@@ -2144,7 +2232,7 @@ class FileAgentWorkflowSession:
         draft_issues = _canonical_partition_issues(
             draft,
             expected_aliases=expected_aliases,
-            eligible_aliases=expected_aliases.difference(required_exclusion_aliases),
+            eligible_aliases={alias_by_id[cid] for cid in baseline_ids}.difference(required_exclusion_aliases),
             required_exclusion_aliases=required_exclusion_aliases,
             must_link_groups=must_link_aliases,
         )
@@ -2180,7 +2268,7 @@ class FileAgentWorkflowSession:
             payload,
             expected_draft_unit_ids=set(draft_unit_ids),
             expected_aliases=expected_aliases,
-            eligible_aliases=expected_aliases.difference(required_exclusion_aliases),
+            eligible_aliases={alias_by_id[cid] for cid in baseline_ids}.difference(required_exclusion_aliases),
             required_exclusion_aliases=required_exclusion_aliases,
             must_link_groups=must_link_aliases,
         )
@@ -2203,7 +2291,7 @@ class FileAgentWorkflowSession:
             audit_recovery=_CanonicalAuditRecoveryContext(
                 expected_draft_unit_ids=set(draft_unit_ids),
                 expected_aliases=expected_aliases,
-                eligible_aliases=expected_aliases.difference(required_exclusion_aliases),
+                eligible_aliases={alias_by_id[cid] for cid in baseline_ids}.difference(required_exclusion_aliases),
                 required_exclusion_aliases=required_exclusion_aliases,
                 must_link_groups=must_link_aliases,
             ),
@@ -2243,10 +2331,10 @@ class FileAgentWorkflowSession:
                     importance=proposal.importance,
                     required_for_completeness=True,
                     equivalent_candidate_ids=candidate_ids,
-                    evidence_ids=sorted({item for unit in source_units for item in unit.evidence_ids}),
-                    source_span_ids=sorted({item for unit in source_units for item in unit.source_span_ids}),
+                    evidence_ids=sorted({item for cid in candidate_ids for item in candidates_by_id[cid].evidence_ids}),
+                    source_span_ids=sorted({item for cid in candidate_ids for item in candidates_by_id[cid].source_span_ids}),
                     source_quotes=_ordered_unique(
-                        quote for unit in source_units for quote in unit.source_quotes
+                        quote for cid in candidate_ids for quote in candidates_by_id[cid].source_quotes
                     ),
                     adjudication_case_ids=case_ids,
                     scoring_mode="required",
@@ -2257,8 +2345,12 @@ class FileAgentWorkflowSession:
                             "rationale": proposal.rationale,
                             "workspace_id": self.workspace_id,
                         },
-                        "evidence_records": _merged_metadata_rows(source_units, "evidence_records", "evidence_id"),
-                        "candidate_provenance": _merged_metadata_rows(source_units, "candidate_provenance", "candidate_id"),
+                        "evidence_records": _candidate_evidence_records(candidate_ids, candidates_by_id),
+                        "candidate_provenance": _candidate_provenance(candidate_ids, candidates_by_id),
+                        "comparison_equivalence_group_ids": [
+                            group.group_id for group in pending_groups
+                            if set(candidate_ids).intersection(group.member_candidate_ids)
+                        ],
                     },
                 )
             )
@@ -2275,6 +2367,7 @@ class FileAgentWorkflowSession:
             "schema": "claims_silver_file_workflow_v1",
             "workspace_id": self.workspace_id,
             "canonical_exclusions": excluded,
+            "reviewed_equivalence_groups": [group.model_dump(mode="json") for group in pending_groups],
             "canonical_audit_findings": [
                 finding.model_dump(mode="json") for finding in output.findings
             ],
@@ -2852,6 +2945,16 @@ def _validate_comparison_output(
                 ],
             }
         )
+    grouped_aliases: set[str] = set()
+    for group in output.equivalence_groups:
+        members = set(group)
+        if (len(members) < 2 or len(members) != len(group)
+                or not members.issubset(candidates_by_alias) or members.intersection(grouped_aliases)):
+            issues.append({
+                "code": "invalid_equivalence_group", "severity": "warning",
+                "message": "Equivalence groups must be disjoint and contain at least two distinct known candidates.",
+            })
+        grouped_aliases.update(members)
     return _ComparisonOutputValidation(
         issues=issues,
         missing_reviewed_aliases=set(missing_reviewed),
@@ -2903,6 +3006,11 @@ def _targeted_comparison_repair_task(
     return {
         **task,
         "candidates": included,
+        "provisional_similarity_groups": [
+            [alias for alias in group if alias in included_aliases]
+            for group in task.get("provisional_similarity_groups", [])
+            if len(set(group).intersection(included_aliases)) >= 2
+        ],
         "source_spans": {
             span_id: text
             for span_id, text in (task.get("source_spans") or {}).items()
@@ -2963,6 +3071,10 @@ def _merge_targeted_comparison_repair(
 
     return ComparisonAgentOutput(
         submission_reviews=list(reviews_by_submission.values()),
+        equivalence_groups=[
+            group for group in original.equivalence_groups
+            if not set(group).intersection(target_aliases)
+        ] + [group for group in repair.equivalence_groups if set(group).intersection(target_aliases)],
     )
 
 
@@ -3447,7 +3559,7 @@ def _canonical_candidate_payload(candidate: ComparisonCandidate, alias: str) -> 
         "statement": candidate.statement,
         "qualifier": candidate.qualifier,
         "evidence_ids": candidate.evidence_ids,
-        "source_span_ids": candidate.source_span_ids,
+        "source_span_ids": _eligibility_candidate_span_ids(candidate),
         "source_quotes": candidate.source_quotes,
         "evidence_records": candidate.metadata.get("evidence_records", []),
         "evidence_eligible": _candidate_has_linked_evidence(candidate),
@@ -4160,6 +4272,15 @@ def _canonical_audit_repair_task(
     return {
         **task,
         "accepted_candidates": accepted_candidates,
+        "candidate_admission_status": {
+            alias: status for alias, status in task.get("candidate_admission_status", {}).items()
+            if alias in aliases
+        },
+        "pending_equivalence_groups": [
+            {**group, "candidate_ids": [alias for alias in group["candidate_ids"] if alias in aliases]}
+            for group in task.get("pending_equivalence_groups", [])
+            if aliases.intersection(group["candidate_ids"])
+        ],
         "source_spans": {
             span_id: text
             for span_id, text in (task.get("source_spans") or {}).items()

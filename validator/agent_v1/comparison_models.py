@@ -57,6 +57,13 @@ class CandidatePairEdge(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class EquivalenceGroup(BaseModel):
+    group_id: str
+    member_candidate_ids: list[str] = Field(min_length=2)
+    comparison_edge_ids: list[str] = Field(default_factory=list)
+    status: Literal["pending_canonical_audit"] = "pending_canonical_audit"
+
+
 class BronzeDiffCase(BaseModel):
     case_id: str
     paper_id: str

@@ -27,3 +27,14 @@ Create one canonical Silver unit for each unique scientific claim. Prevent split
 - Write one strict JSON object matching the supplied schema to the required output file.
 
 Do not modify input files and do not finish before the output file validates.
+
+## Pending comparison equivalence groups
+
+The candidate catalog may also contain members of `pending_equivalence_groups`.
+Consult `candidate_admission_status`: these members have not passed eligibility
+adjudication. Independently review each member's scientific eligibility and its
+own linked evidence against the paper before including it. Another member's
+support does not rescue an unsupported submitted claim. Comparison confirmed
+meaning only; group proposals are not mandatory same-unit constraints. Split
+material differences, exclude unsupported members, and retain each supported
+member's identity and evidence in the final partition.

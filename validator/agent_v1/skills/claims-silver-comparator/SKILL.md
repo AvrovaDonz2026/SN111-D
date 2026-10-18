@@ -13,6 +13,8 @@ Identify actionable scientific relationships between reference candidates and su
 
 ## Rules
 
+- Return `equivalence_groups` as disjoint arrays of candidate references for strictly equivalent findings, including equivalent miner-only findings. Check every member's scope, population, conditions, outcome, direction, and material qualifiers together. Similarity proposals are retrieval hints, never proof of equivalence. Omit uncertain groups; source support is checked later in canonicalization. Continue emitting all required submission review rows and reference relations.
+
 - Emit exactly one row in `submission_reviews` for every submission candidate.
 - Put each actionable reference relationship exactly once in that submission's `reference_relations`. Do not mirror or duplicate it elsewhere.
 - When a submission has no actionable reference relationship, emit an empty `reference_relations` array and a specific `no_actionable_relation_reason` naming the closest reference and the material scientific difference.

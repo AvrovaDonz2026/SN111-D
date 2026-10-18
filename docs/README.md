@@ -20,6 +20,7 @@
 - [agent_v1 Validator System](./0015-agent-v1-validator-system.md)
 - [Targon Container Deployment](./0016-targon-container-deployment.md)
 - [V1 Consensus Validator](./0017-v1-consensus-validator.md)
+- [Equivalence Group Routing](./0019-equivalence-group-routing.md)
 
 ## Purpose
 

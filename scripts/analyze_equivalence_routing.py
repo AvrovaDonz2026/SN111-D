@@ -89,6 +89,14 @@ def analyze(root):
             r = arm_report["reliability"]
             counts = reliability_counts[arm]
             counts["completed_papers"] += 1
+            counts["audit_executed_papers"] += any(
+                s["stage_key"].startswith("canonicalization_audit")
+                for s in r.get("manifest_stages", [])
+            )
+            checks = r.get("quality_checks")
+            counts["completed_audit_quality_checks"] += bool(checks) and all(
+                checks.values()
+            )
             counts["audit_repaired_papers"] += bool(r["audit_repaired"])
             counts["draft_repaired_papers"] += bool(r["draft_repaired"])
             counts["audit_findings"] += len(r["audit_findings"])
@@ -178,6 +186,26 @@ def analyze(root):
                     "group_id": group["group_id"],
                     "before_retained_members": kept["before"],
                     "after_retained_members": kept["after"],
+                    "before_canonical_statements": [
+                        u.get("statement", "")
+                        for u in records["before"]["silver_units"]
+                        if members.intersection(u["equivalent_candidate_ids"])
+                    ],
+                    "after_canonical_statements": [
+                        u.get("statement", "")
+                        for u in records["after"]["silver_units"]
+                        if members.intersection(u["equivalent_candidate_ids"])
+                    ],
+                    "before_importance": [
+                        u.get("importance")
+                        for u in records["before"]["silver_units"]
+                        if members.intersection(u["equivalent_candidate_ids"])
+                    ],
+                    "after_importance": [
+                        u.get("importance")
+                        for u in records["after"]["silver_units"]
+                        if members.intersection(u["equivalent_candidate_ids"])
+                    ],
                     "finding_present_before": bool(kept["before"]),
                     "finding_present_after": bool(kept["after"]),
                     "finding_acceptance_changed": bool(kept["before"])
@@ -219,6 +247,33 @@ def analyze(root):
         arm: {component: dict(v) for component, v in components.items()}
         for arm, components in totals.items()
     }
+    cohorts = {}
+    for name, has_groups in [("with_bypass", True), ("without_bypass", False)]:
+        selected = [
+            p for p in paired if bool(p["comparison"].get("groups")) == has_groups
+        ]
+        cohort = {
+            "paper_count": len(selected),
+            "paper_ids": [p["paper_id"] for p in selected],
+            "arms": {},
+        }
+        for arm in ["before", "after"]:
+            events = []
+            for paper in selected:
+                folder = root / paper["paper_id"]
+                events += read(folder / arm / "usage_events.json", [])
+                events += read(folder / "comparison_usage_events.json", [])
+            cohort["arms"][arm] = {
+                "all_recorded_attempts": usage_summary(events),
+                "excluding_failed_attempts": usage_summary(
+                    [e for e in events if e["status"] != "failed"]
+                ),
+                "failed_attempt_tokens": {
+                    key: sum(e.get(key) or 0 for e in events if e["status"] == "failed")
+                    for key in ["prompt_tokens", "completion_tokens", "total_tokens"]
+                },
+            }
+        cohorts[name] = cohort
     savings = {
         field: percent_reduction(
             tokens["before"].get("all", {}).get(field, 0),
@@ -232,6 +287,7 @@ def analyze(root):
         "measurement_issues": measurement_issues,
         "paired_usage": tokens,
         "paired_reduction_pct": savings,
+        "cohorts": cohorts,
         "physical_model_usage": usage_summary(physical),
         "all_attempt_usage_logical": {
             arm: usage_summary(e) for arm, e in all_attempts.items()

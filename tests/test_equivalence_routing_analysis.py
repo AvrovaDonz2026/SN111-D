@@ -76,6 +76,8 @@ def test_shared_comparison_counted_once_physically_and_equally_in_both_arms(tmp_
     assert result["physical_model_usage"]["all"]["completion_tokens"] == 35
     assert result["paired_usage"]["before"]["all"]["completion_tokens"] == 25
     assert result["paired_usage"]["after"]["all"]["completion_tokens"] == 15
+    assert result["cohorts"]["with_bypass"]["paper_count"] == 1
+    assert result["cohorts"]["without_bypass"]["paper_count"] == 0
     assert result["papers"][0]["changed_group_members"] == 1
     assert result["papers"][0]["changed_other_candidates"] == 0
     assert result["group_decision_changes"][0]["finding_acceptance_changed"] is False

@@ -76,5 +76,21 @@ Offline tests cover embedding-chain resistance, strict versus material relations
 miner-only groups, saved-artifact reload and scope checks, mixed and all-grouped
 papers, exclusion of unsupported members, exclusion of an entire pending group,
 retained evidence/provenance, and ordinary coverage for multiple contributing
-miners. Judge system instructions are unchanged. Model-backed quality and token
-savings must still be measured with paired replays before deployment.
+miners. Judge system instructions are unchanged.
+
+Five uncached paired testnet replays on 2026-10-18 recorded output tokens falling
+from 639,093 to 475,806 (25.5%) and measured-stage total tokens from 1,406,811 to
+1,098,001 (22.0%). Canonicalization total tokens increased 38.4%; all ten draft/audit
+sequences completed without repair. Nine of 28 remaining jointly decided cases
+changed decisions, and source-support admission differences require review.
+No-bypass controls also varied, so the aggregate reduction is not a stable causal
+estimate for larger mainnet panels. Keep the bypass experimental pending review.
+
+The paired runner disables DSPy memory/disk caches and stage resume. Successful
+zero-usage responses invalidate measurement. Comparison is shared between arms
+and charged logically once per arm; embedding counters, extraction and reference
+generation are outside these totals. The control uses the new comparator with
+bypass disabled, rather than the complete pre-feature comparator contract.
+A separate uncached audit-only testnet smoke completed without backend or weight
+writes. Detailed results and private source artifacts are retained in Claims Team
+Outputs, dated 2026-10-18, rather than committed to this repository.

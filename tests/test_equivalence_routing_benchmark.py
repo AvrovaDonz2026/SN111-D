@@ -91,3 +91,18 @@ def test_usage_keeps_failed_calls_and_reports_missing_usage():
     assert totals["all"]["completion_tokens"] == 30
     assert totals["canonicalization"]["failed_events"] == 2
     assert totals["canonicalization"]["unknown_usage_events"] == 1
+
+
+def test_live_benchmark_disables_both_dspy_caches(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+    from scripts.benchmark_equivalence_routing import disable_response_cache
+
+    observed = []
+    monkeypatch.setitem(
+        sys.modules,
+        "dspy",
+        SimpleNamespace(configure_cache=lambda **kwargs: observed.append(kwargs)),
+    )
+    disable_response_cache()
+    assert observed == [{"enable_disk_cache": False, "enable_memory_cache": False}]

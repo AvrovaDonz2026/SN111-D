@@ -29,6 +29,14 @@ from validator.agent_v1.orchestrator import (
 from validator.agent_v1.record_projection import project_agent_artifact
 
 
+def disable_response_cache():
+    # DSPy cache hits clear usage and would make a repeated arm appear free.
+    # This affects only this benchmark process, never other VM services.
+    import dspy
+
+    dspy.configure_cache(enable_disk_cache=False, enable_memory_cache=False)
+
+
 def read(path):
     return json.loads(Path(path).read_text())
 
@@ -446,6 +454,7 @@ def main():
             )
         )
         return 0
+    disable_response_cache()
     base = FileAgentWorkflowConfig.from_env()
     config = replace(
         base,
@@ -476,6 +485,7 @@ def main():
             ["git", "rev-parse", "HEAD"], text=True
         ).strip(),
         "model": args.model,
+        "response_cache": {"disk": False, "memory": False, "stage_resume": False},
         "settings": {
             key: getattr(config, key)
             for key in [

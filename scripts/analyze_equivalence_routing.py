@@ -19,10 +19,33 @@ def read(path, default=None):
 def analyze(root):
     root = Path(root)
     reports = [read(p) for p in sorted(root.glob("openalex*/report.json"))]
+    measurement_issues = {}
+    for report in reports:
+        folder = root / report["paper_id"]
+        issues = []
+        for path in [
+            folder / "comparison_usage_events.json",
+            *[folder / a / "usage_events.json" for a in ["before", "after"]],
+        ]:
+            for event in read(path, []):
+                if (
+                    event.get("status") == "success"
+                    and (event.get("total_tokens") or 0) <= 0
+                ):
+                    issues.append(
+                        {
+                            "file": str(path.relative_to(root)),
+                            "stage": event["stage_key"],
+                            "issue": "successful_model_event_has_no_positive_token_usage",
+                        }
+                    )
+        if issues:
+            measurement_issues[report["paper_id"]] = issues
     paired = [
         p
         for p in reports
-        if all(
+        if p["paper_id"] not in measurement_issues
+        and all(
             p.get("arms", {}).get(a, {}).get("status") == "complete"
             for a in ["before", "after"]
         )
@@ -206,6 +229,7 @@ def analyze(root):
     return {
         "completed_paired_papers": len(paired),
         "reports_found": len(reports),
+        "measurement_issues": measurement_issues,
         "paired_usage": tokens,
         "paired_reduction_pct": savings,
         "physical_model_usage": usage_summary(physical),

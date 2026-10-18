@@ -107,3 +107,33 @@ def test_failed_paper_costs_remain_visible_and_do_not_enter_paired_savings(tmp_p
         == 1
     )
     assert len(result["failures"]) == 1
+
+
+def test_successful_cached_zero_usage_is_flagged_and_excluded(tmp_path):
+    folder = tmp_path / "openalex_cached"
+    save(folder / "comparison_usage_events.json", [event("silver_comparison", 5)])
+    save(
+        folder / "before/usage_events.json",
+        [
+            {
+                "stage_key": "silver_canonicalization_audit",
+                "status": "success",
+                "total_tokens": 0,
+                "completion_tokens": 0,
+            }
+        ],
+    )
+    save(
+        folder / "report.json",
+        {
+            "paper_id": "openalex_cached",
+            "comparison": {"status": "complete"},
+            "arms": {arm: {"status": "complete"} for arm in ["before", "after"]},
+        },
+    )
+    result = analyze(tmp_path)
+    assert result["completed_paired_papers"] == 0
+    assert (
+        result["measurement_issues"]["openalex_cached"][0]["stage"]
+        == "silver_canonicalization_audit"
+    )

@@ -223,9 +223,9 @@ def reliability(record, session_root, source_map, groups):
     }
 
 
-def run_paper(item, index, args, config):
+def fixture_inputs(item, manifest_dir):
     paper = item["paper_id"]
-    folder = args.manifest.parent / item["fixture_dir"]
+    folder = manifest_dir / item["fixture_dir"]
     bronze, source = read(folder / "bronze.json"), read(folder / "source.json")
     miners = [
         MinerArtifactSubmission(
@@ -246,6 +246,16 @@ def run_paper(item, index, args, config):
     evidence_spans = {sid for c in candidates for sid in c.source_span_ids}
     if evidence_spans - source_map.keys():
         raise ValueError(f"{paper}: unknown input source spans")
+    if any(c.paper_id not in {None, paper} for c in candidates):
+        raise ValueError(f"{paper}: candidate belongs to a different paper")
+    return bronze, source, miners, candidates, source_map
+
+
+def run_paper(item, index, args, config):
+    paper = item["paper_id"]
+    bronze, source, miners, candidates, source_map = fixture_inputs(
+        item, args.manifest.parent
+    )
     out = args.output_dir / paper
     out.mkdir(parents=True)
     fixture = {
@@ -385,6 +395,11 @@ def main():
     parser.add_argument("--env-file", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--model", default="deepseek/deepseek-v4-flash")
+    parser.add_argument(
+        "--validate-only",
+        action="store_true",
+        help="Check all fixture identities and span references without model calls.",
+    )
     parser.add_argument("--limit", type=int, default=5, choices=range(1, 6))
     parser.add_argument("--workers", type=int, default=2, choices=[1, 2])
     args = parser.parse_args()
@@ -394,6 +409,43 @@ def main():
         parser.error("Use a new output directory.")
     load_dotenv(args.env_file, override=True)
     args.output_dir.mkdir(parents=True)
+    items = read(args.manifest)[: args.limit]
+    if not items or len({item["paper_id"] for item in items}) != len(items):
+        parser.error("Use a nonempty manifest of distinct papers.")
+    if args.validate_only:
+        papers = []
+        for item in items:
+            bronze, source, miners, candidates, source_map = fixture_inputs(
+                item, args.manifest.parent
+            )
+            papers.append(
+                {
+                    "paper_id": item["paper_id"],
+                    "candidate_count": len(candidates),
+                    "miner_count": len(miners),
+                    "source_span_count": len(source_map),
+                    "input_sha256": hashlib.sha256(
+                        json.dumps(
+                            {
+                                "bronze": bronze,
+                                "source": source,
+                                "miners": [asdict(m) for m in miners],
+                            },
+                            sort_keys=True,
+                        ).encode()
+                    ).hexdigest(),
+                }
+            )
+        write(
+            args.output_dir / "input_validation.json",
+            {"status": "validated", "model_calls": 0, "papers": papers},
+        )
+        print(
+            json.dumps(
+                {"status": "validated", "model_calls": 0, "papers": papers}, indent=2
+            )
+        )
+        return 0
     base = FileAgentWorkflowConfig.from_env()
     config = replace(
         base,
@@ -417,7 +469,6 @@ def main():
         fallback_to_legacy=False,
         resume_existing_stages=False,
     )
-    items = read(args.manifest)[: args.limit]
     status = {
         "schema": "claims_equivalence_routing_benchmark_v1",
         "started_at": datetime.now(timezone.utc).isoformat(),

@@ -60,20 +60,43 @@ partition. No additional canonicalization pass or new judge is introduced.
 
 ## Scoring and consensus
 
-Ordinary coverage and reward calculations are unchanged. Every retained miner
-member can cover the resulting Silver unit. Fractional `1/n` shared coverage is a
-separate scoring experiment and is not enabled by this change.
+Set `CLAIMS_SILVER_EQUIVALENCE_SHARED_COVERAGE=true` (or
+`--claims.silver-equivalence-shared-coverage true`) to use fractional coverage in
+validator scoring. The code default is `false`, preserving ordinary coverage for
+existing deployments; the mainnet inventory explicitly enables it for rollout.
+No backend migration is required. The switch is recorded in the run config snapshot,
+Silver metadata, and per-miner score metadata.
 
-An offline experiment is available in `scripts/replay_equivalence_shared_coverage.py`.
-It reads frozen replay records and diagnostic-corrected scores, verifies ordinary
-coverage reproduction, and assigns `1/n` only to retained comparison-group members.
-Groups merged into a final Silver unit use a single pool of distinct retained group
-miners. Bronze and duplicate claims from one miner do not increase `n`. Nongroup-only
-contributors keep full credit. The default `group-priority` policy keeps group members
-fractional even if they also have another candidate in the unit; an explicit
-`--mixed-contributor-policy max-credit` variant measures that alternative.
-Importance denominators, minor-tier caps and diagnostic/adjudication quality stay
-fixed. This script does not modify deployed scoring or submit weights.
+For each final Silver unit with approved comparison-group provenance, retained
+group members share its weighted coverage credit as `1/n`, where `n` is the number
+of distinct retained group miners. Groups merged into a final unit use one pool.
+Bronze, excluded members and duplicate claims from one miner do not increase `n`.
+Nongroup-only contributors retain full credit. A group member stays fractional even
+if another candidate from the same miner is also retained in that unit; this is the
+`group-priority` policy evaluated offline. Units without approved groups retain
+ordinary coverage.
+
+Importance denominators, the 5% minor-tier cap, diagnostic/adjudication quality and
+batch payout policy are unchanged. The fractional numerator is used in `coverage`
+and hence the final `score`. Metadata also preserves `ordinary_coverage`, the policy,
+and per-unit divisor/credit for inspection. Binary covered/missing-unit lists still
+indicate whether a miner contributed, rather than pretending partial credit is a
+missing submission.
+
+Canonical candidate ownership, reviewed group membership and final-unit group tags
+must agree. Inconsistent group provenance fails scoring rather than silently awarding
+full credit. Older records without group provenance retain ordinary coverage.
+
+`scripts/replay_equivalence_shared_coverage.py` uses the same production pooling and
+weighted coverage implementation to reproduce fixed-Silver experiments. Its optional
+`--mixed-contributor-policy max-credit` variant is analysis-only; the production
+policy is group priority. The integrated scorer reproduced all 488 submitted-paper
+results from the saved 49-paper experiment, including quality, and switching it off
+reproduced all ordinary scores. No new model calls were needed.
+
+The sampled verbose paper keeps equivalence bypass enabled. Verbose output changes
+the contract for cases reaching the panel; it does not disable group routing or
+shared scoring. Use the bypass and sharing switches independently for rollback.
 
 Backend consensus materialization reads actual eligibility adjudication decisions
 and their original candidate findings. Bypassed groups do not fabricate panel

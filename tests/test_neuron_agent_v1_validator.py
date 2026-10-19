@@ -1251,6 +1251,8 @@ def test_neuron_silver_post_pass_counts_all_miner_missing_paper_as_zero(tmp_path
 @pytest.mark.parametrize("compact", [False, True])
 def test_neuron_silver_post_pass_parallelizes_batch_papers(monkeypatch, tmp_path, compact) -> None:
     observed_contracts = {}
+    observed_sharing = {}
+    observed_bypass = {}
     bronze_root = tmp_path / "bronze"
     started_count = 0
     started_lock = threading.Lock()
@@ -1282,6 +1284,8 @@ def test_neuron_silver_post_pass_parallelizes_batch_papers(monkeypatch, tmp_path
         nonlocal started_count
         workflow = _kwargs.get("file_agent_workflow")
         observed_contracts[paper_id] = workflow.config.eligibility_output_contract if workflow else "legacy"
+        observed_sharing[paper_id] = _kwargs["equivalence_shared_coverage"]
+        observed_bypass[paper_id] = workflow.config.equivalence_group_bypass if workflow else None
         with started_lock:
             started_count += 1
             if started_count == 2:
@@ -1334,6 +1338,7 @@ def test_neuron_silver_post_pass_parallelizes_batch_papers(monkeypatch, tmp_path
         claims_network="testnet",
         claims_batch_score_rule="mean",
         claims_silver_paper_max_workers=2,
+        claims_silver_equivalence_shared_coverage=compact,
     )
     validator.backend_client = None
     validator.bt_logging = _logger()
@@ -1370,7 +1375,9 @@ def test_neuron_silver_post_pass_parallelizes_batch_papers(monkeypatch, tmp_path
     assert started_count == 2
     assert scores == {7: 1.0}
 
+    assert set(observed_sharing.values()) == {compact}
     if compact:
+        assert set(observed_bypass.values()) == {True}
         assert sorted(observed_contracts.values()) == ["compact", "verbose"]
         sampling = validator._active_silver_batch_outcome["eligibility_output_sampling"]
         assert observed_contracts[sampling["verbose_paper_id"]] == "verbose"
@@ -2691,3 +2698,47 @@ class _CapturingBackend:
             for rows in (cases, votes, consensus, decisions, silver_records, score_reports)
         )
         return {"accepted": accepted, "chunks": 1}
+
+
+@pytest.mark.parametrize(
+    "env,cli,expected",
+    [
+        (None, [], False),
+        ("true", [], True),
+        ("false", [], False),
+        ("false", ["--claims.silver-equivalence-shared-coverage", "true"], True),
+    ],
+)
+def test_shared_coverage_environment_cli_and_effective_config(
+    monkeypatch, tmp_path, env, cli, expected
+):
+    if env is None:
+        monkeypatch.delenv("CLAIMS_SILVER_EQUIVALENCE_SHARED_COVERAGE", raising=False)
+    else:
+        monkeypatch.setenv("CLAIMS_SILVER_EQUIVALENCE_SHARED_COVERAGE", env)
+    monkeypatch.setattr("neurons.validator.load_dotenv", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        "neurons.validator._validate_silver_model_configuration", lambda config: None
+    )
+    monkeypatch.setattr(
+        "neurons.validator._apply_bittensor_args", lambda config, args: None
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["validator", "--netuid", "111", "--claims.task-artifact", "test.json", *cli],
+    )
+    v = ClaimsValidator.__new__(ClaimsValidator)
+    adapter = SimpleNamespace(add_args=lambda parser: None)
+    v.Subtensor = v.Wallet = v.bt_logging = adapter
+    v.Config = lambda parser: SimpleNamespace(
+        netuid=111,
+        logging=SimpleNamespace(logging_dir=str(tmp_path)),
+        wallet=SimpleNamespace(name="test", hotkey="test"),
+    )
+    config = v._get_config()
+    assert config.claims_silver_equivalence_shared_coverage is expected
+    assert (
+        _run_config_snapshot(config)["claims_silver_equivalence_shared_coverage"]
+        is expected
+    )

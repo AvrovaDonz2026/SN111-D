@@ -852,6 +852,13 @@ class ClaimsValidator:
             help="Maximum evidence-supported central/supporting claims retained per miner and paper.",
         )
         parser.add_argument(
+            "--claims.silver-equivalence-shared-coverage",
+            dest="claims_silver_equivalence_shared_coverage",
+            type=_parse_bool,
+            default=_strict_env_flag("CLAIMS_SILVER_EQUIVALENCE_SHARED_COVERAGE", False),
+            help="Share coverage among distinct retained miners in approved equivalence groups only.",
+        )
+        parser.add_argument(
             "--claims.silver-filter-by-assessment",
             dest="claims_silver_filter_by_assessment",
             type=_parse_bool,
@@ -1178,6 +1185,9 @@ class ClaimsValidator:
             raise SystemExit("--claims.silver-max-eligible-claims-per-miner must be positive.")
         if config.claims_silver_max_adjudication_cases_per_paper <= 0:
             raise SystemExit("--claims.silver-max-adjudication-cases-per-paper must be positive.")
+        config.claims_silver_equivalence_shared_coverage = (
+            parsed_args.claims_silver_equivalence_shared_coverage
+        )
         config.claims_silver_filter_by_assessment = (
             parsed_args.claims_silver_filter_by_assessment
         )
@@ -3340,6 +3350,9 @@ class ClaimsValidator:
                             6,
                         )
                         or 0
+                    ),
+                    equivalence_shared_coverage=bool(
+                        getattr(self.config, "claims_silver_equivalence_shared_coverage", False)
                     ),
                     filter_by_assessment=bool(
                         getattr(
@@ -7173,6 +7186,9 @@ def _run_config_snapshot(config: Any) -> dict[str, Any]:
         "claims_silver_paper_max_workers": int(getattr(config, "claims_silver_paper_max_workers", 1) or 1),
         "claims_silver_max_eligible_claims_per_miner": int(
             getattr(config, "claims_silver_max_eligible_claims_per_miner", 10) or 0
+        ),
+        "claims_silver_equivalence_shared_coverage": bool(
+            getattr(config, "claims_silver_equivalence_shared_coverage", False)
         ),
         "claims_silver_filter_by_assessment": bool(
             getattr(config, "claims_silver_filter_by_assessment", False)

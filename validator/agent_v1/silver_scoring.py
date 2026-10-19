@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from .comparison_models import ComparisonCandidate, SilverRecord, SilverScoreBreakdown, SilverUnit
 from .models import AgentV1ValidationFinding
+from .equivalence_scoring import equivalence_credit_audit
 from .scoring import PENALTIES, score_findings
 
 
@@ -19,6 +20,7 @@ def score_miner_against_silver(
     miner_candidates: list[ComparisonCandidate],
     silver_record: SilverRecord,
     normal_findings: list[AgentV1ValidationFinding] | None = None,
+    equivalence_shared_coverage: bool = False,
 ) -> SilverScoreBreakdown:
     normal_findings = normal_findings or []
     miner_candidate_ids = {candidate.candidate_id for candidate in miner_candidates}
@@ -70,7 +72,37 @@ def score_miner_against_silver(
             )
         )
 
-    coverage = _coverage(scored_units, covered)
+    ordinary_coverage = _coverage(scored_units, covered)
+    credit_by_unit = {}
+    credit_details = []
+    scored_unit_by_id = {u.silver_unit_id: u for u in scored_units}
+    if equivalence_shared_coverage:
+        for detail in equivalence_credit_audit(silver_record):
+            uid = detail["silver_unit_id"]
+            if uid not in covered:
+                continue
+            # Local submission ownership must agree with canonical provenance.
+            unit = scored_unit_by_id.get(uid)
+            if unit is None:
+                continue
+            provenance = {p["candidate_id"]: p for p in unit.metadata["candidate_provenance"]}
+            if any(
+                provenance[cid].get("miner_id") != miner_id
+                for cid in miner_candidate_ids.intersection(unit.equivalent_candidate_ids)
+            ):
+                raise ValueError("Miner submission disagrees with canonical ownership")
+            credited = detail["credit_by_miner"].get(miner_id)
+            if credited is None:
+                raise ValueError("Miner submission disagrees with canonical ownership")
+            credit_by_unit[uid] = credited
+            credit_details.append({
+                "silver_unit_id": uid,
+                "group_ids": detail["group_ids"],
+                "divisor": detail["n"],
+                "credit": credited,
+                "group_member": miner_id in detail["group_miners"],
+            })
+    coverage = _coverage(scored_units, covered, credit_by_unit=credit_by_unit)
     diagnostic_quality, _diagnostic_passed, diagnostic_summary = score_findings(normal_findings)
     adjudication_quality = _adjudication_quality(findings)
     quality = max(0.0, round(diagnostic_quality * adjudication_quality, 4))
@@ -100,6 +132,9 @@ def score_miner_against_silver(
             "finding_summary": summary,
             "diagnostic_finding_summary": diagnostic_summary,
             "coverage": coverage,
+            "ordinary_coverage": ordinary_coverage,
+            "coverage_policy": "equivalence_shared" if equivalence_shared_coverage else "ordinary",
+            "equivalence_unit_credits": credit_details,
             "diagnostic_quality": diagnostic_quality,
             "adjudication_quality": adjudication_quality,
             "quality_formula": "diagnostic_quality * adjudication_quality",
@@ -129,7 +164,12 @@ def _scored_units(units: list[SilverUnit]) -> list[SilverUnit]:
     return [unit for unit in units if unit.required_for_completeness or unit.scoring_mode == "accepted_improvement"]
 
 
-def _coverage(scored_units: list[SilverUnit], covered_unit_ids: list[str]) -> float:
+def _coverage(
+    scored_units: list[SilverUnit],
+    covered_unit_ids: list[str],
+    *,
+    credit_by_unit: dict[str, float] | None = None,
+) -> float:
     covered = set(covered_unit_ids)
     central_supporting_total = 0.0
     central_supporting_covered = 0.0
@@ -137,14 +177,20 @@ def _coverage(scored_units: list[SilverUnit], covered_unit_ids: list[str]) -> fl
     minor_covered = 0.0
     for unit in scored_units:
         weight = IMPORTANCE_WEIGHTS[unit.importance]
+        credit = (
+            (credit_by_unit or {}).get(unit.silver_unit_id, 1.0)
+            if unit.silver_unit_id in covered else 0.0
+        )
+        if not 0 <= credit <= 1:
+            raise ValueError("Coverage credit outside [0, 1]")
         if unit.importance == "minor":
             minor_total += weight
             if unit.silver_unit_id in covered:
-                minor_covered += weight
+                minor_covered += weight * credit
         else:
             central_supporting_total += weight
             if unit.silver_unit_id in covered:
-                central_supporting_covered += weight
+                central_supporting_covered += weight * credit
 
     if central_supporting_total <= 0:
         return 1.0 if minor_total <= 0 else round(minor_covered / minor_total, 4)

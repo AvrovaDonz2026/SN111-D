@@ -49,6 +49,7 @@ class MinerPaperSubmission:
 class SilverScoringJob:
     submission: MinerPaperSubmission
     silver_record: SilverRecord
+    equivalence_shared_coverage: bool = False
 
 
 @dataclass(frozen=True)
@@ -98,6 +99,7 @@ def run_paper_silver_pipeline(
     adjudication_batch_size: int = 4,
     max_eligible_claims_per_miner: int = 10,
     filter_by_assessment: bool = False,
+    equivalence_shared_coverage: bool = False,
     max_adjudication_cases: int = 80,
     adjudication_progress_sink: Callable[
         [list[AdjudicationContextBundle], list[AdjudicationVote]],
@@ -503,9 +505,20 @@ def run_paper_silver_pipeline(
             LOGGER.exception("Could not finalize file-agent workspace for paper=%s.", paper_id)
     stage_timings.append(_stage_finish(graph_timer, paper_id=paper_id))
 
+    silver_record.metadata["coverage_scoring"] = {
+        "policy": "equivalence_shared" if equivalence_shared_coverage else "ordinary",
+        "version": 1,
+    }
     scoring_timer = _stage_start("silver_scoring", "Silver scoring")
     scores = score_silver_jobs_parallel(
-        [SilverScoringJob(submission=submission, silver_record=silver_record) for submission in miner_submissions]
+        [
+            SilverScoringJob(
+                submission=submission,
+                silver_record=silver_record,
+                equivalence_shared_coverage=equivalence_shared_coverage,
+            )
+            for submission in miner_submissions
+        ]
     )
     stage_timings.append(_stage_finish(
         scoring_timer,
@@ -556,6 +569,7 @@ def _score_job(job: SilverScoringJob) -> SilverScoreBreakdown:
         miner_candidates=job.submission.candidates,
         silver_record=job.silver_record,
         normal_findings=job.submission.normal_findings,
+        equivalence_shared_coverage=job.equivalence_shared_coverage,
     )
 
 

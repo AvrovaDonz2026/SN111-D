@@ -19,69 +19,29 @@ from scripts.benchmark_equivalence_routing import read, write
 from validator.agent_v1.comparison_models import SilverRecord
 from validator.agent_v1.record_projection import project_agent_artifact
 from validator.agent_v1.silver_scoring import (
-    IMPORTANCE_WEIGHTS,
-    MINOR_TIER_CAP,
     _scored_units,
     _silver_score,
 )
 
 
-def unit_credit(unit, groups, owner, mixed_policy="group-priority"):
-    """Return credit by miner and independently inspectable provenance."""
-    retained = set(unit.equivalent_candidate_ids)
-    if retained - owner.keys():
-        raise ValueError("Final candidate owner is unknown")
-    group_ids = unit.metadata.get("comparison_equivalence_group_ids", [])
-    if set(group_ids) - groups.keys():
-        raise ValueError("Unknown approved comparison group")
-    expected = {g for g, members in groups.items() if retained.intersection(members)}
-    if set(group_ids) != expected:
-        raise ValueError("Retained group membership does not match unit provenance")
-    members = set().union(*(set(groups[g]) for g in group_ids)) if group_ids else set()
-    eligible = retained & members
-    grouped_miners = {owner[c] for c in eligible if owner[c] is not None}
-    independent = {owner[c] for c in retained - eligible if owner[c] is not None}
-    n = len(grouped_miners)
-    credits = {m: 1 / n for m in grouped_miners} if n else {}
-    if mixed_policy not in {"max-credit", "group-priority"}:
-        raise ValueError("Unknown mixed-contributor policy")
-    full_credit = (
-        independent if mixed_policy == "max-credit" else independent - grouped_miners
-    )
-    credits.update({m: 1.0 for m in full_credit})
-    return credits, {
-        "silver_unit_id": unit.silver_unit_id,
-        "group_ids": group_ids,
-        "retained_group_candidates": sorted(eligible),
-        "group_miners": sorted(grouped_miners),
-        "n": n,
-        "independent_miners": sorted(independent),
-        "full_credit_overrides": sorted(full_credit & grouped_miners),
-        "mixed_policy": mixed_policy,
-        "credit_by_miner": credits,
-    }
+# Reuse production ownership/pooling rules so the offline replay tests the deployed policy.
+from validator.agent_v1.equivalence_scoring import unit_credit
 
 
 def fractional_coverage(units, credits, miner_id):
-    """Keep the existing importance denominator and minor-tier cap unchanged."""
-    major_total = minor_total = major_credit = minor_credit = 0.0
-    for u in units:
-        weight = IMPORTANCE_WEIGHTS[u.importance]
-        credit = credits[u.silver_unit_id].get(miner_id, 0.0)
-        if not 0 <= credit <= 1:
-            raise ValueError("Coverage credit outside [0, 1]")
-        if u.importance == "minor":
-            minor_total += weight
-            minor_credit += weight * credit
-        else:
-            major_total += weight
-            major_credit += weight * credit
-    if major_total <= 0:
-        return 1.0 if minor_total <= 0 else round(minor_credit / minor_total, 4)
-    cap = MINOR_TIER_CAP / (1 - MINOR_TIER_CAP) * major_total
-    return round(
-        (major_credit + min(minor_credit, cap)) / (major_total + min(minor_total, cap)),
-        4,
+    from validator.agent_v1.silver_scoring import _coverage
+
+    covered = [
+        u.silver_unit_id
+        for u in units
+        if credits[u.silver_unit_id].get(miner_id, 0) > 0
+    ]
+    return _coverage(
+        units,
+        covered,
+        credit_by_unit={
+            u.silver_unit_id: credits[u.silver_unit_id].get(miner_id, 0) for u in units
+        },
     )
 
 

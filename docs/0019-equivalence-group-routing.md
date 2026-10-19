@@ -64,6 +64,17 @@ Ordinary coverage and reward calculations are unchanged. Every retained miner
 member can cover the resulting Silver unit. Fractional `1/n` shared coverage is a
 separate scoring experiment and is not enabled by this change.
 
+An offline experiment is available in `scripts/replay_equivalence_shared_coverage.py`.
+It reads frozen replay records and diagnostic-corrected scores, verifies ordinary
+coverage reproduction, and assigns `1/n` only to retained comparison-group members.
+Groups merged into a final Silver unit use a single pool of distinct retained group
+miners. Bronze and duplicate claims from one miner do not increase `n`. Nongroup-only
+contributors keep full credit. The default `group-priority` policy keeps group members
+fractional even if they also have another candidate in the unit; an explicit
+`--mixed-contributor-policy max-credit` variant measures that alternative.
+Importance denominators, minor-tier caps and diagnostic/adjudication quality stay
+fixed. This script does not modify deployed scoring or submit weights.
+
 Backend consensus materialization reads actual eligibility adjudication decisions
 and their original candidate findings. Bypassed groups do not fabricate panel
 votes or consensus cases; their provenance is stored in Silver metadata. Existing

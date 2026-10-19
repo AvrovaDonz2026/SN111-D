@@ -62,8 +62,10 @@ partition. No additional canonicalization pass or new judge is introduced.
 
 Set `CLAIMS_SILVER_EQUIVALENCE_SHARED_COVERAGE=true` (or
 `--claims.silver-equivalence-shared-coverage true`) to use fractional coverage in
-validator scoring. The code default is `false`, preserving ordinary coverage for
-existing deployments; the mainnet inventory explicitly enables it for rollout.
+validator scoring. The code default is `true`; the mainnet inventory also explicitly enables it.
+Set the environment switch to `false` (or pass the CLI flag as `false`) to restore
+ordinary coverage. Historical benchmark runners explicitly disable sharing to
+preserve their ordinary-score controls.
 No backend migration is required. The switch is recorded in the run config snapshot,
 Silver metadata, and per-miner score metadata.
 

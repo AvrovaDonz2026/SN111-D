@@ -7,7 +7,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from datetime import datetime, timezone
 import hashlib
-import json
 import os
 from pathlib import Path
 import re
@@ -105,6 +104,7 @@ def replay(item, args, config, verbose_paper):
             miner_artifacts=miners,
             silver_record_id="mainnet_replay_" + pid,
             adjudication_passes=[],
+            equivalence_shared_coverage=False,
             paper_context=source.get("paper") or bronze.get("paper") or {},
             source_context_by_span_id=merged,
             eligibility_source_context_by_span_id=eligibility,

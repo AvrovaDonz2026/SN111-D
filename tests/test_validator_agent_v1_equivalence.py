@@ -480,7 +480,7 @@ def test_complete_pipeline_keeps_two_equivalent_miners_and_scores_from_audited_m
         "miner:1:C01",
         "miner:2:C01",
     ]
-    assert [score.coverage for score in result.scores] == [1.0, 1.0]
+    assert [score.coverage for score in result.scores] == [0.5, 0.5]
     assert (
         len(result.silver_record.silver_units[0].metadata["candidate_provenance"]) == 3
     )

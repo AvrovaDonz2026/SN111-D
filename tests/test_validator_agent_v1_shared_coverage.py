@@ -89,14 +89,17 @@ def test_production_group_priority_weights_and_fixed_diagnostic_penalty():
         )
     ]
     ordinary = score_miner_against_silver(
-        miner_id="A", miner_candidates=cs, silver_record=r, normal_findings=findings
+        miner_id="A",
+        miner_candidates=cs,
+        silver_record=r,
+        normal_findings=findings,
+        equivalence_shared_coverage=False,
     )
     shared = score_miner_against_silver(
         miner_id="A",
         miner_candidates=cs,
         silver_record=r,
         normal_findings=findings,
-        equivalence_shared_coverage=True,
     )
     assert ordinary.coverage == 1
     assert shared.coverage == 0.65  # central 0.7/2 + supporting 0.3, denominator 1
@@ -122,7 +125,7 @@ def test_legacy_record_without_groups_retains_ordinary_scoring_when_enabled():
     r.metadata = {}
     r.silver_units[0].metadata = {}
     kwargs = dict(miner_id="A", miner_candidates=[candidate("A")], silver_record=r)
-    a = score_miner_against_silver(**kwargs)
+    a = score_miner_against_silver(**kwargs, equivalence_shared_coverage=False)
     b = score_miner_against_silver(**kwargs, equivalence_shared_coverage=True)
     assert (a.score, a.coverage, a.quality) == (b.score, b.coverage, b.quality)
 
@@ -239,7 +242,6 @@ def test_orchestrator_routes_enabled_scoring_and_persists_policy():
         ],
         silver_record_id="s",
         adjudication_passes=[],
-        equivalence_shared_coverage=True,
         file_agent_workflow=SimpleNamespace(
             start_session=lambda **kwargs: Session(**kwargs)
         ),

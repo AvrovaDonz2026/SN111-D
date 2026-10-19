@@ -49,7 +49,7 @@ class MinerPaperSubmission:
 class SilverScoringJob:
     submission: MinerPaperSubmission
     silver_record: SilverRecord
-    equivalence_shared_coverage: bool = False
+    equivalence_shared_coverage: bool = True
 
 
 @dataclass(frozen=True)
@@ -99,7 +99,7 @@ def run_paper_silver_pipeline(
     adjudication_batch_size: int = 4,
     max_eligible_claims_per_miner: int = 10,
     filter_by_assessment: bool = False,
-    equivalence_shared_coverage: bool = False,
+    equivalence_shared_coverage: bool = True,
     max_adjudication_cases: int = 80,
     adjudication_progress_sink: Callable[
         [list[AdjudicationContextBundle], list[AdjudicationVote]],

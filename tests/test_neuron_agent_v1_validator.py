@@ -2703,10 +2703,11 @@ class _CapturingBackend:
 @pytest.mark.parametrize(
     "env,cli,expected",
     [
-        (None, [], False),
+        (None, [], True),
         ("true", [], True),
         ("false", [], False),
         ("false", ["--claims.silver-equivalence-shared-coverage", "true"], True),
+        ("true", ["--claims.silver-equivalence-shared-coverage", "false"], False),
     ],
 )
 def test_shared_coverage_environment_cli_and_effective_config(

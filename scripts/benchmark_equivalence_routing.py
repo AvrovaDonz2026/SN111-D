@@ -334,6 +334,7 @@ def run_paper(item, index, args, config):
                 miner_artifacts=miners,
                 silver_record_id=arm,
                 adjudication_passes=[],
+                equivalence_shared_coverage=False,
                 paper_context=source.get("paper") or bronze.get("paper") or {},
                 source_context_by_span_id=source_map,
                 eligibility_source_context_by_span_id=source_map,

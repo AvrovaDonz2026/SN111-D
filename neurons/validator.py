@@ -855,7 +855,7 @@ class ClaimsValidator:
             "--claims.silver-equivalence-shared-coverage",
             dest="claims_silver_equivalence_shared_coverage",
             type=_parse_bool,
-            default=_strict_env_flag("CLAIMS_SILVER_EQUIVALENCE_SHARED_COVERAGE", False),
+            default=_strict_env_flag("CLAIMS_SILVER_EQUIVALENCE_SHARED_COVERAGE", True),
             help="Share coverage among distinct retained miners in approved equivalence groups only.",
         )
         parser.add_argument(
@@ -3352,7 +3352,7 @@ class ClaimsValidator:
                         or 0
                     ),
                     equivalence_shared_coverage=bool(
-                        getattr(self.config, "claims_silver_equivalence_shared_coverage", False)
+                        getattr(self.config, "claims_silver_equivalence_shared_coverage", True)
                     ),
                     filter_by_assessment=bool(
                         getattr(
@@ -7188,7 +7188,7 @@ def _run_config_snapshot(config: Any) -> dict[str, Any]:
             getattr(config, "claims_silver_max_eligible_claims_per_miner", 10) or 0
         ),
         "claims_silver_equivalence_shared_coverage": bool(
-            getattr(config, "claims_silver_equivalence_shared_coverage", False)
+            getattr(config, "claims_silver_equivalence_shared_coverage", True)
         ),
         "claims_silver_filter_by_assessment": bool(
             getattr(config, "claims_silver_filter_by_assessment", False)

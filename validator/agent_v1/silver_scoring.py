@@ -20,7 +20,7 @@ def score_miner_against_silver(
     miner_candidates: list[ComparisonCandidate],
     silver_record: SilverRecord,
     normal_findings: list[AgentV1ValidationFinding] | None = None,
-    equivalence_shared_coverage: bool = False,
+    equivalence_shared_coverage: bool = True,
 ) -> SilverScoreBreakdown:
     normal_findings = normal_findings or []
     miner_candidate_ids = {candidate.candidate_id for candidate in miner_candidates}

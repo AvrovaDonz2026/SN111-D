@@ -220,7 +220,7 @@ class ClaimsMiner:
             dest="claims_backend_retries",
             type=int,
             default=int(os.getenv("CLAIMS_BACKEND_RETRIES", "2")),
-            help="Claims backend retry count for artifact uploads.",
+            help="Claims backend retry count for HTTP 503 and transient network/TLS failures.",
         )
         parser.add_argument(
             "--claims.backend-retry-backoff",

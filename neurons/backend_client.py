@@ -25,7 +25,7 @@ class ClaimsBackendClient:
     wallet: Any
     network: str = "testnet"
     timeout_seconds: float = 30.0
-    max_retries: int = 0
+    max_retries: int = 2
     retry_backoff_seconds: float = 1.0
 
     def get(self, path: str, *, query: dict[str, Any] | None = None) -> Any:
@@ -580,6 +580,10 @@ class ClaimsBackendClient:
                     return response.read()
             except HTTPError as exc:
                 detail = exc.read().decode("utf-8", errors="replace")
+                exc.close()
+                if exc.code == 503 and attempt + 1 < attempts:
+                    time.sleep(self._retry_delay(attempt))
+                    continue
                 raise BackendClientError(f"Backend {method.upper()} {path} failed: {exc.code} {detail}") from exc
             except (URLError, TimeoutError, OSError) as exc:
                 last_error = exc

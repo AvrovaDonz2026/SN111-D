@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import gzip
+import io
 import json
 from types import SimpleNamespace
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
+
+import pytest
 
 import neurons.backend_client as backend_client_module
+import validator.agent_v1.backend_client as agent_backend_client_module
 from neurons.backend_client import ClaimsBackendClient
 from validator.agent_v1.backend_client import ClaimsBackendClient as AgentV1ClaimsBackendClient
 from validator.agent_v1.comparison_models import SilverRecord
@@ -35,6 +39,88 @@ class _FakeResponse:
 def _header(request, name: str) -> str:
     headers = {key.lower(): value for key, value in request.headers.items()}
     return headers[name.lower()]
+
+
+@pytest.mark.parametrize("client_kind", ["neuron", "agent"])
+@pytest.mark.parametrize("path", ["/miner/artifacts", "/validator/bronze-records"])
+def test_upload_retries_503_with_same_payload_and_fresh_signature(monkeypatch, client_kind, path):
+    requests = []
+    delays = []
+    errors = []
+
+    def fake_urlopen(request, *, timeout):
+        requests.append(request)
+        if len(requests) < 3:
+            error = HTTPError(request.full_url, 503, "Unavailable", {}, io.BytesIO(b"nonce write failed"))
+            errors.append(error)
+            raise error
+        return _FakeResponse({"stored": True})
+
+    if client_kind == "neuron":
+        monkeypatch.setattr(backend_client_module, "urlopen", fake_urlopen)
+        client = ClaimsBackendClient("https://api.example.test", wallet=SimpleNamespace(hotkey=_FakeHotkey()))
+        upload = lambda: client.post(path, {"record_id": "stable_id"})
+    else:
+        monkeypatch.setattr(agent_backend_client_module.urllib.request, "urlopen", fake_urlopen)
+        client = AgentV1ClaimsBackendClient("https://api.example.test", keypair=_FakeHotkey())
+        upload = lambda: client._request("POST", path, body={"record_id": "stable_id"})
+    monkeypatch.setattr(backend_client_module.time, "sleep", delays.append)
+
+    assert upload() == {"stored": True}
+    assert len({request.data for request in requests}) == 1
+    assert len({_header(request, "X-Claims-Nonce") for request in requests}) == 3
+    assert all(_header(request, "X-Claims-Signature") for request in requests)
+    assert delays == [1.0, 2.0]
+    assert all(error.closed for error in errors)
+
+
+@pytest.mark.parametrize("client_kind", ["neuron", "agent"])
+@pytest.mark.parametrize("status,retries,expected_attempts", [(503, 2, 3), (503, 0, 1), (401, 2, 1), (409, 2, 1)])
+def test_upload_http_errors_respect_retry_budget(monkeypatch, client_kind, status, retries, expected_attempts):
+    requests = []
+    delays = []
+
+    def fake_urlopen(request, *, timeout):
+        requests.append(request)
+        raise HTTPError(request.full_url, status, "Failed", {}, io.BytesIO(b"original failure detail"))
+
+    path = "/validator/bronze-records"
+    if client_kind == "neuron":
+        monkeypatch.setattr(backend_client_module, "urlopen", fake_urlopen)
+        client = ClaimsBackendClient("https://api.example.test", wallet=SimpleNamespace(hotkey=_FakeHotkey()), max_retries=retries)
+        upload = lambda: client.post(path, {})
+    else:
+        monkeypatch.setattr(agent_backend_client_module.urllib.request, "urlopen", fake_urlopen)
+        client = AgentV1ClaimsBackendClient("https://api.example.test", keypair=_FakeHotkey(), max_retries=retries)
+        upload = lambda: client._request("POST", path, body={})
+    monkeypatch.setattr(backend_client_module.time, "sleep", delays.append)
+
+    with pytest.raises(RuntimeError, match=f"{status} original failure detail"):
+        upload()
+    assert len(requests) == expected_attempts
+    assert len(delays) == expected_attempts - 1
+
+
+def test_compressed_miner_upload_retries_503_without_changing_body(monkeypatch):
+    requests = []
+
+    def fake_urlopen(request, *, timeout):
+        requests.append(request)
+        if len(requests) == 1:
+            raise HTTPError(request.full_url, 503, "Unavailable", {}, io.BytesIO(b"storage unavailable"))
+        return _FakeResponse({"submission_id": "stable_id"})
+
+    monkeypatch.setattr(backend_client_module, "urlopen", fake_urlopen)
+    monkeypatch.setattr(backend_client_module.time, "sleep", lambda _: None)
+    client = ClaimsBackendClient("https://api.example.test", wallet=SimpleNamespace(hotkey=_FakeHotkey()))
+    payload = {"submission_id": "stable_id", "responses": [{"quote": "x" * 3_600_000}]}
+
+    assert client.post_miner_consensus_submission(payload) == {"submission_id": "stable_id"}
+    assert len(requests) == 2
+    assert requests[0].data == requests[1].data
+    assert json.loads(gzip.decompress(requests[1].data)) == payload
+    assert _header(requests[1], "Content-Encoding") == "gzip"
+    assert _header(requests[0], "X-Claims-Nonce") != _header(requests[1], "X-Claims-Nonce")
 
 
 def test_backend_client_retries_transient_errors_with_fresh_nonce(monkeypatch) -> None:

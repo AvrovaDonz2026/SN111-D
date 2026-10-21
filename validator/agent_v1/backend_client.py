@@ -30,11 +30,15 @@ class ClaimsBackendClient:
         hotkey: str | None = None,
         keypair: SigningKeypair | None = None,
         network: str = "testnet",
+        max_retries: int = 2,
+        retry_backoff_seconds: float = 1.0,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.hotkey = hotkey or keypair.ss58_address if keypair is not None else hotkey
         self.keypair = keypair
         self.network = network
+        self.max_retries = max_retries
+        self.retry_backoff_seconds = retry_backoff_seconds
 
     def get_bronze(self, *, paper_id: str, reference_release_id: str) -> BronzeRecord:
         row = self.get_bronze_record(paper_id=paper_id, reference_release_id=reference_release_id)
@@ -229,13 +233,20 @@ class ClaimsBackendClient:
         url = f"{self.base_url}{path}"
         if query:
             url = f"{url}?{query}"
-        request = urllib.request.Request(url, data=data if method != "GET" else None, method=method, headers=self._headers(method, path, query, data))
-        try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                raw = response.read().decode("utf-8")
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode(errors="replace")
-            raise RuntimeError(f"Claims backend {method} {path} failed: {exc.code} {detail}") from exc
+        attempts = max(1, int(self.max_retries) + 1)
+        for attempt in range(attempts):
+            request = urllib.request.Request(url, data=data if method != "GET" else None, method=method, headers=self._headers(method, path, query, data))
+            try:
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    raw = response.read().decode("utf-8")
+                break
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode(errors="replace")
+                exc.close()
+                if exc.code == 503 and attempt + 1 < attempts:
+                    time.sleep(min(max(0.0, self.retry_backoff_seconds) * (2**attempt), 10.0))
+                    continue
+                raise RuntimeError(f"Claims backend {method} {path} failed: {exc.code} {detail}") from exc
         if not raw:
             return {}
         return json.loads(raw)

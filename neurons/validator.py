@@ -334,7 +334,7 @@ class ClaimsValidator:
             dest="claims_backend_retries",
             type=int,
             default=int(os.getenv("CLAIMS_BACKEND_RETRIES", "2")),
-            help="Number of retries for transient Claims backend network/TLS failures.",
+            help="Number of retries for Claims backend HTTP 503 and transient network/TLS failures.",
         )
         parser.add_argument(
             "--claims.backend-retry-backoff",

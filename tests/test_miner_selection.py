@@ -893,6 +893,9 @@ def test_completed_scores_record_every_selected_uid_including_zero(mode: str) ->
 def test_eligible_miner_requires_serving_axon_but_not_absence_of_validator_permit() -> None:
     validator = ClaimsValidator.__new__(ClaimsValidator)
     validator.wallet = SimpleNamespace(hotkey=SimpleNamespace(ss58_address="validator_hotkey"))
+    # Operator-share gating reads self.config; keep defaults so this unit test
+    # only asserts axon serving / self-exclusion behavior.
+    validator.config = SimpleNamespace(claims_operator_share=0.0, claims_operator_hotkey="")
 
     serving = SimpleNamespace(
         is_null=False,

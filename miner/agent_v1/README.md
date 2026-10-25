@@ -8,13 +8,14 @@ than model-call-shaped.
 
 The runner owns:
 
-- paper ingestion
+- paper ingestion (section index + extraction quality score)
 - per-task run directories
 - skill package loading and hashing
 - runtime invocation
-- output validation and one repair attempt
+- evidence-grounded preflight (structure, quote-in-span, numeric/qualifier grounding)
+- repair feedback from preflight failures
 - ARA markdown materialization
-- runtime metrics aggregation
+- runtime metrics and `paper_metrics.json` aggregation
 
 Agent runtimes own:
 
@@ -78,6 +79,31 @@ The effective retry and timeout controls are `SUBNET_CLAIMS_GROBID_TIMEOUT_S`,
 `SUBNET_CLAIMS_AGENT_MAX_ITERS`, and `SUBNET_CLAIMS_AGENT_MAX_REPAIR_ATTEMPTS`.
 Every non-dry run records these values in `runtime_config.json` and includes
 the same redacted snapshot under `agent_output.json.metadata.runtime_config`.
+
+### Submission preflight and providers
+
+Before upload, `agent_v1` runs `miner.agent_v1.preflight.run_preflight` against
+the full `source_payload.json`. Invalid artifacts write
+`submission_gate.json` with `status=blocked` and are not treated as
+submit-ready (`metadata.submission_eligible=false`).
+
+Useful env knobs:
+
+```env
+SUBNET_CLAIMS_REQUIRE_SOURCE_GROUNDING=1
+SUBNET_CLAIMS_EXPERIMENT_VERSION=sn111d-preflight-v1
+# OpenAI-compatible example (cha86):
+SUBNET_CLAIMS_AGENT_PROVIDER=cha86
+SUBNET_CLAIMS_AGENT_MODEL=gpt-6-luna
+SUBNET_CLAIMS_AGENT_API_BASE=https://api.cha86.dev/v1
+SUBNET_CLAIMS_AGENT_API_KEY_ENV=CHA86_API_KEY
+CHA86_API_KEY=
+```
+
+Native agent tools include `read_source_span`, `read_section_index`, and
+preflight-backed `validate_agent_artifact`. Follow
+`skills/compiler/references/sn111-two-stage-protocol.md` (source map → claims →
+audit). Each run also writes `paper_metrics.json` for cost/latency A/B.
 
 ## CLI Runtime
 
@@ -165,8 +191,9 @@ SUBNET_CLAIMS_CONSENSUS_MAX_WORKERS=50
 SUBNET_CLAIMS_CONSENSUS_SOURCE_MAX_WORKERS=16
 ```
 
-The reviewer uses structured DSPy calls. OpenRouter and Chutes may be selected
-independently for extraction and consensus.
+The reviewer uses structured DSPy calls at temperature `0`. OpenRouter, Chutes,
+and OpenAI-compatible providers (including cha86) may be selected independently
+for extraction and consensus.
 `SUBNET_CLAIMS_CONSENSUS_SOURCE_MAX_WORKERS` bounds concurrent PDF downloads
 and source-payload extraction independently from concurrent model batches.
 `compatibility` mode exists for protocol tests only and should not be used for

@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .artifact import materialize_agent_artifact, write_agent_validation_report
-from .artifact_models import Artifact
+from .artifact_models import Artifact, unknown_field_diagnostics
 from .config import AgentV1Config
 from .export import write_agent_directory
 from .ingest import InputDocument, apply_paper_metadata_override, document_source_payload, ingest_artifact_json, ingest_pdf, ingest_text
@@ -78,12 +78,15 @@ class AgentV1Runner:
             extraction_source_payload,
             skill_pack.manifest(),
         )
+        self._write_config_snapshot(run_dir)
         artifact, runtime_metrics = self._compile_with_repair(runtime, skill_pack, run_dir, document)
+        schema_diagnostics = artifact.metadata.pop("_schema_diagnostics", [])
         artifact.metadata.update(
             {
                 "pipeline_name": "agent_v1",
                 "output_schema": "agent_v1",
                 "runtime": self.config.runtime,
+                "runtime_config": self.config.observable_snapshot(),
                 "runtime_metrics": runtime_metrics,
                 "skill_name": skill_pack.name,
                 "skill_sha256": skill_pack.sha256,
@@ -93,8 +96,18 @@ class AgentV1Runner:
             }
         )
         issues = validate_agent_artifact(artifact)
+        issues.extend(_unknown_field_issues(schema_diagnostics))
+        validation_status = "valid" if not issues else "invalid"
+        artifact.metadata.update(
+            {
+                "validation_status": validation_status,
+                "validation_issue_count": len(issues),
+                "submission_eligible": not issues,
+            }
+        )
         write_agent_directory(run_dir, artifact)
         write_agent_validation_report(run_dir / "agent_validation_report.json", issues)
+        self._write_submission_gate(run_dir, issues)
         self._write_source_payload(run_dir, source_payload)
         if source_artifact_path and source_artifact_path.exists():
             data_dir = run_dir / "data"
@@ -103,6 +116,34 @@ class AgentV1Runner:
         if issues:
             logger.warning("agent_v1 validation completed with %s issue(s)", len(issues))
         return artifact
+
+    def prepare_run_inputs(
+        self,
+        document: InputDocument,
+        *,
+        output_dir: Path | None = None,
+        source_artifact_path: Path | None = None,
+    ) -> Path:
+        """Materialize inputs and config for an offline preflight without invoking a runtime."""
+        run_dir = (output_dir or (self.config.output_dir / document.paper.paper_id)).absolute()
+        run_dir.mkdir(parents=True, exist_ok=True)
+        source_payload = document_source_payload(document, max_chars=None)
+        extraction_source_payload = document_source_payload(
+            document, max_chars=self.config.max_extraction_source_chars
+        )
+        skill_pack = load_skill_pack(self.config.skill_dir)
+        self._write_run_inputs(run_dir, document, source_payload, extraction_source_payload, skill_pack.manifest())
+        self._write_config_snapshot(run_dir)
+        self._write_source_payload(run_dir, source_payload)
+        if source_artifact_path and source_artifact_path.exists():
+            data_dir = run_dir / "data"
+            data_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_artifact_path, data_dir / source_artifact_path.name)
+        (run_dir / "dry_run_manifest.json").write_text(
+            json.dumps({"status": "ready", "runtime_invoked": False, "input_source": document.source_type}, indent=2),
+            encoding="utf-8",
+        )
+        return run_dir
 
     def _compile_with_repair(
         self,
@@ -134,8 +175,10 @@ class AgentV1Runner:
             self._write_runtime_files(run_dir, result.manifest, result.stdout, result.stderr)
             raw = _read_json_object(result.output_path)
             last_raw = raw
+            schema_diagnostics = unknown_field_diagnostics(raw)
             artifact = materialize_agent_artifact(raw, fallback_paper=document.paper.model_dump(mode="json"))
             issues = validate_agent_artifact(artifact)
+            issues.extend(_unknown_field_issues(schema_diagnostics))
             if not issues:
                 return artifact, _runtime_metrics(manifests)
             feedback = {
@@ -149,7 +192,9 @@ class AgentV1Runner:
                 ],
             }
             logger.info("agent_v1 attempt %s produced %s validation issue(s)", attempt + 1, len(issues))
-        return materialize_agent_artifact(last_raw, fallback_paper=document.paper.model_dump(mode="json")), _runtime_metrics(manifests)
+        artifact = materialize_agent_artifact(last_raw, fallback_paper=document.paper.model_dump(mode="json"))
+        artifact.metadata["_schema_diagnostics"] = unknown_field_diagnostics(last_raw)
+        return artifact, _runtime_metrics(manifests)
 
     def _write_run_inputs(
         self,
@@ -189,6 +234,26 @@ class AgentV1Runner:
         (run_dir / "backend_stdout.txt").write_text(stdout, encoding="utf-8")
         (run_dir / "backend_stderr.txt").write_text(stderr, encoding="utf-8")
 
+    def _write_config_snapshot(self, run_dir: Path) -> None:
+        (run_dir / "runtime_config.json").write_text(
+            json.dumps(self.config.observable_snapshot(), indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+
+    def _write_submission_gate(self, run_dir: Path, issues: list[dict[str, Any]]) -> None:
+        """Persist an explicit local gate so invalid artifacts cannot look submit-ready."""
+        codes = sorted({str(issue.get("code") or "unknown") for issue in issues})
+        payload = {
+            "status": "eligible" if not issues else "blocked",
+            "submission_eligible": not issues,
+            "issue_count": len(issues),
+            "issue_codes": codes,
+            "validation_report": "agent_validation_report.json",
+        }
+        (run_dir / "submission_gate.json").write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
     def _write_source_payload(self, output_dir: Path, source_payload: dict[str, Any]) -> None:
         data_dir = output_dir / "data"
         data_dir.mkdir(parents=True, exist_ok=True)
@@ -204,6 +269,17 @@ def _read_json_object(path: Path) -> dict[str, Any]:
     except Exception:
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _unknown_field_issues(diagnostics: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "path": str(item.get("path") or "$"),
+            "code": "unknown_field",
+            "message": str(item.get("message") or "unknown artifact field"),
+        }
+        for item in diagnostics
+    ]
 
 
 def _runtime_source_payload_path(runtime: str) -> str:

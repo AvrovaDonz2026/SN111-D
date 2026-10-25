@@ -4,7 +4,7 @@ import os
 import shlex
 from pathlib import Path
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .provider import normalize_provider, provider_api_base, provider_api_key_env
 
@@ -16,22 +16,22 @@ class AgentV1Config(BaseModel):
     output_dir: Path
     runtime: str = "dspy-react"
     skill_dir: Path
-    timeout_seconds: int = 1800
-    max_extraction_source_chars: int = 60000
+    timeout_seconds: int = Field(default=1800, ge=1)
+    max_extraction_source_chars: int = Field(default=60000, ge=1)
     pdf_reader: str = "pdf-inspector"
     grobid_url: str = "http://localhost:8070/"
-    grobid_timeout_s: int = 120
-    grobid_retries: int = 3
-    grobid_retry_wait_s: int = 2
+    grobid_timeout_s: int = Field(default=120, ge=1)
+    grobid_retries: int = Field(default=3, ge=0)
+    grobid_retry_wait_s: int = Field(default=2, ge=0)
     model: str = "openrouter/google/gemma-4-27b-it"
     provider: str = "openrouter"
     api_key_env: str = "OPENROUTER_API_KEY"
     api_key: str | None = None
     api_base: str = "https://openrouter.ai/api/v1"
-    temperature: float = 0.2
-    max_tokens: int = 32768
-    max_agent_iters: int = 4
-    max_repair_attempts: int = 3
+    temperature: float = Field(default=0.2, ge=0)
+    max_tokens: int = Field(default=32768, ge=1)
+    max_agent_iters: int = Field(default=4, ge=1)
+    max_repair_attempts: int = Field(default=3, ge=1)
     cli_command: list[str] = []
 
     @classmethod
@@ -85,6 +85,29 @@ class AgentV1Config(BaseModel):
         if not self.api_key:
             raise SystemExit(f"{self.api_key_env} is required for agent_v1 model runtimes.")
         return self.api_key
+
+    def observable_snapshot(self) -> dict[str, object]:
+        """Return run metadata without exposing credentials."""
+        return {
+            "runtime": self.runtime,
+            "provider": self.provider,
+            "model": self.model,
+            "api_base": self.api_base,
+            "api_key_env": self.api_key_env,
+            "skill_dir": str(self.skill_dir),
+            "timeout_seconds": self.timeout_seconds,
+            "max_extraction_source_chars": self.max_extraction_source_chars,
+            "pdf_reader": self.pdf_reader,
+            "grobid_url": self.grobid_url,
+            "grobid_timeout_s": self.grobid_timeout_s,
+            "grobid_retries": self.grobid_retries,
+            "grobid_retry_wait_s": self.grobid_retry_wait_s,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "max_agent_iters": self.max_agent_iters,
+            "max_repair_attempts": self.max_repair_attempts,
+            "cli_command_configured": bool(self.cli_command),
+        }
 
 
 def _pdf_reader_from_env() -> str:

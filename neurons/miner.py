@@ -19,6 +19,8 @@ from dotenv import load_dotenv
 
 from miner.agent_v1.config import AgentV1Config
 from miner.agent_v1.consensus_review import ConsensusSourceError, review_consensus_assignment
+from miner.agent_v1.artifact_models import Artifact, unknown_field_diagnostics
+from miner.agent_v1.artifact_validator import validate_agent_artifact
 from miner.agent_v1.ingest import (
     PDF_READERS,
     SOURCE_PAYLOAD_POLICY_VERSION,
@@ -597,7 +599,13 @@ class ClaimsMiner:
         while True:
             cached = self._read_cached_extraction(cache_key)
             if cached is not None:
-                return cached, self._read_cached_source_payload(cache_key)
+                cached_source_payload = self._read_cached_source_payload(cache_key)
+                if self.config.claims_pipeline == "agent_v1" and cached_source_payload is None:
+                    self.bt_logging.warning(
+                        f"Ignoring agent_v1 extraction cache without source payload cache_key={cache_key[:12]}"
+                    )
+                else:
+                    return cached, cached_source_payload
             with condition:
                 if cache_key not in self._in_progress_keys:
                     self._in_progress_keys.add(cache_key)
@@ -728,6 +736,8 @@ class ClaimsMiner:
         extraction: dict[str, Any],
         source_payload: dict[str, Any] | None,
     ) -> dict[str, Any] | None:
+        if _submission_gate_blocks(extraction):
+            raise RuntimeError("agent_v1 submission gate blocked batch artifact")
         if getattr(self, "backend_client", None) is None:
             return None
         if not task.run_id:
@@ -865,6 +875,11 @@ class ClaimsMiner:
                 "cache_key": cache_key,
             }
         )
+        if _submission_gate_blocks(payload):
+            gate = _read_json_object(output_dir / "submission_gate.json") or {}
+            issue_codes = ", ".join(str(code) for code in gate.get("issue_codes", []) if code)
+            suffix = f" ({issue_codes})" if issue_codes else ""
+            raise RuntimeError(f"agent_v1 submission gate blocked artifact{suffix}")
         source_payload = _read_json_object(output_dir / "source_payload.json")
         self._log_finished_task(task_label, output_dir, payload)
         self._write_cached_extraction(cache_key, payload)
@@ -920,8 +935,27 @@ class ClaimsMiner:
         path = self._cache_path(cache_key)
         if not path.exists():
             return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            self.bt_logging.warning(f"Ignoring invalid Claims extraction cache cache_key={cache_key[:12]}: {exc}")
+            return None
+        if not isinstance(payload, dict):
+            self.bt_logging.warning(f"Ignoring non-object Claims extraction cache cache_key={cache_key[:12]}")
+            return None
+        if self.config.claims_pipeline == "agent_v1" and not _agent_v1_cache_shape_is_usable(payload):
+            self.bt_logging.warning(f"Ignoring malformed agent_v1 extraction cache cache_key={cache_key[:12]}")
+            return None
+        if self.config.claims_pipeline == "agent_v1":
+            metadata = payload.get("metadata")
+            if not isinstance(metadata, dict) or metadata.get("submission_eligible") is not True:
+                self.bt_logging.warning(f"Ignoring agent_v1 extraction cache without explicit eligibility cache_key={cache_key[:12]}")
+                return None
+            if not _agent_v1_cached_artifact_is_valid(payload):
+                self.bt_logging.warning(f"Ignoring invalid agent_v1 extraction cache cache_key={cache_key[:12]}")
+                return None
         self.bt_logging.info(f"Returning cached Claims extraction for cache_key={cache_key[:12]}")
-        return json.loads(path.read_text(encoding="utf-8"))
+        return payload
 
     def _write_cached_extraction(self, cache_key: str, payload: dict[str, Any]) -> None:
         path = self._cache_path(cache_key)
@@ -932,7 +966,11 @@ class ClaimsMiner:
         path = self._source_payload_cache_path(cache_key)
         if not path.exists():
             return None
-        return _read_json_object(path)
+        payload = _read_json_object(path)
+        if self.config.claims_pipeline == "agent_v1" and not _agent_v1_source_payload_is_usable(payload):
+            self.bt_logging.warning(f"Ignoring malformed agent_v1 source payload cache cache_key={cache_key[:12]}")
+            return None
+        return payload
 
     def _write_cached_source_payload(self, cache_key: str, payload: dict[str, Any] | None) -> None:
         if not payload:
@@ -982,6 +1020,78 @@ def _read_json_object(path: Path) -> dict[str, Any] | None:
     except Exception:
         return None
     return parsed if isinstance(parsed, dict) else None
+
+
+def _agent_v1_cache_shape_is_usable(payload: dict[str, Any]) -> bool:
+    """Reject cache entries that cannot be an agent_v1 artifact before reuse."""
+    paper = payload.get("paper")
+    logic = payload.get("logic")
+    evidence = payload.get("evidence")
+    metadata = payload.get("metadata", {})
+    return (
+        isinstance(paper, dict)
+        and isinstance(logic, dict)
+        and isinstance(logic.get("claims"), list)
+        and isinstance(evidence, dict)
+        and isinstance(evidence.get("records"), list)
+        and isinstance(metadata, dict)
+    )
+
+
+def _agent_v1_cached_artifact_is_valid(payload: dict[str, Any]) -> bool:
+    """Revalidate the full artifact before trusting an agent_v1 cache hit."""
+    if unknown_field_diagnostics(payload):
+        return False
+    try:
+        artifact = Artifact.model_validate(payload)
+    except (TypeError, ValueError):
+        return False
+    return not validate_agent_artifact(artifact)
+
+
+def _agent_v1_source_payload_is_usable(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("schema_version") != SOURCE_PAYLOAD_SCHEMA_VERSION:
+        return False
+    if payload.get("policy_version") != SOURCE_PAYLOAD_POLICY_VERSION:
+        return False
+    if not isinstance(payload.get("paper"), dict):
+        return False
+    spans = payload.get("spans")
+    if not isinstance(spans, list) or not spans:
+        return False
+    if any(
+        not isinstance(span, dict)
+        or not isinstance(span.get("span_id"), str)
+        or not isinstance(span.get("paper_id"), str)
+        or not isinstance(span.get("text"), str)
+        or not span["text"].strip()
+        for span in spans
+    ):
+        return False
+    integrity = payload.get("source_integrity")
+    if not isinstance(integrity, dict) or integrity.get("schema") != "claims_source_payload_integrity_v1":
+        return False
+    source_text = "\n\n".join(span["text"] for span in spans)
+    return (
+        integrity.get("span_count") == len(spans)
+        and integrity.get("character_count") == sum(len(span["text"]) for span in spans)
+        and integrity.get("content_sha256") == hashlib.sha256(source_text.encode("utf-8")).hexdigest()
+        and isinstance(integrity.get("truncated"), bool)
+        and isinstance(integrity.get("complete_span_count"), int)
+        and isinstance(integrity.get("complete_character_count"), int)
+    )
+
+
+def _submission_gate_blocks(payload: Any) -> bool:
+    """Block agent_v1 artifacts unless submission eligibility is explicit."""
+    if not isinstance(payload, dict):
+        return True
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, dict):
+        return True
+    return metadata.get("submission_eligible") is not True
 
 
 def _json_byte_size(payload: Any) -> int:

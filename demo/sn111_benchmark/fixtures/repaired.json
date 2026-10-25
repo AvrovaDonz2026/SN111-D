@@ -1,0 +1,21 @@
+{
+  "ara_version": "1.0",
+  "paper": {"paper_id": "fixture-paper", "title": "Fixture study", "claims_summary": ["Claim one", "Claim two", "Claim three"]},
+  "logic": {"claims": [
+    {"claim_id": "C1", "statement": "Treatment improves recovery.", "conditions": "In the fixture cohort.", "status": "supported", "falsification_criteria": "No improvement.", "proof": ["E1"], "evidence_ids": ["EV1"], "sources": [{"source_id": "S1", "source_type": "span", "span_ids": ["p1"], "role": "result"}]},
+    {"claim_id": "C2", "statement": "The effect replicates.", "conditions": "In an independent cohort.", "status": "supported", "falsification_criteria": "Replication fails.", "proof": ["E2"], "evidence_ids": ["EV2"], "sources": [{"source_id": "S2", "source_type": "span", "span_ids": ["p2"], "role": "result"}]},
+    {"claim_id": "C3", "statement": "The method is efficient.", "conditions": "Under fixture settings.", "status": "supported", "falsification_criteria": "Runtime worsens.", "proof": ["E3"], "evidence_ids": ["EV3"], "sources": [{"source_id": "S3", "source_type": "span", "span_ids": ["p3"], "role": "method"}]}
+  ], "experiments": [
+    {"experiment_id": "E1", "title": "Test one", "verifies": ["C1"], "setup": "setup", "procedure": "procedure", "expected_outcome": "outcome", "evidence_ids": ["EV1"]},
+    {"experiment_id": "E2", "title": "Test two", "verifies": ["C2"], "setup": "setup", "procedure": "procedure", "expected_outcome": "outcome", "evidence_ids": ["EV2"]},
+    {"experiment_id": "E3", "title": "Test three", "verifies": ["C3"], "setup": "setup", "procedure": "procedure", "expected_outcome": "outcome", "evidence_ids": ["EV3"]}
+  ]},
+  "evidence": {"records": [
+    {"evidence_id": "EV1", "title": "E1", "role": "support", "summary": "Observed improvement.", "source_refs": [{"source_id": "S1", "source_type": "span", "span_ids": ["p1"], "role": "result"}], "linked_claim_ids": ["C1"]},
+    {"evidence_id": "EV2", "title": "E2", "role": "support", "summary": "Observed replication.", "source_refs": [{"source_id": "S2", "source_type": "span", "span_ids": ["p2"], "role": "result"}], "linked_claim_ids": ["C2"]},
+    {"evidence_id": "EV3", "title": "E3", "role": "support", "summary": "Observed efficiency.", "source_refs": [{"source_id": "S3", "source_type": "span", "span_ids": ["p3"], "role": "method"}], "linked_claim_ids": ["C3"]}
+  ]},
+  "trace": {"node_id": "Q0", "node_type": "question", "summary": "Fixture question", "evidence": ["C1", "C2", "C3"], "children": []},
+  "src": {"environment": ["fixture"], "artifacts": []},
+  "metadata": {"runtime_metrics": {"elapsed_seconds": 2.0, "cost_usd": 0.03, "cost_kind": "actual"}}
+}

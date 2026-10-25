@@ -55,6 +55,30 @@ python -m miner.agent_v1 --artifact-json /path/to/artifact.json --output-dir /tm
 PDF inputs use `pdf-inspector` by default. Use `--pdf-reader pypdf` for the
 simple PyPDF path or `--pdf-reader grobid` when you want GROBID/TEI extraction.
 
+### Offline preflight profile
+
+Use `--dry-run` to exercise local ingestion, skill loading, schema generation,
+and configuration parsing without invoking DSPy, LangChain, a CLI agent, an
+inference provider, or a wallet. It writes the normal input files plus:
+
+```text
+runtime_config.json   # redacted effective runtime settings
+dry_run_manifest.json # confirms that no runtime was invoked
+```
+
+```bash
+python -m miner.agent_v1 \
+  --text examples/agent_v1_smoke.txt \
+  --output-dir /tmp/agent_v1_dry_run \
+  --dry-run
+```
+
+The effective retry and timeout controls are `SUBNET_CLAIMS_GROBID_TIMEOUT_S`,
+`SUBNET_CLAIMS_GROBID_RETRIES`, `SUBNET_CLAIMS_GROBID_RETRY_WAIT_S`, `SUBNET_CLAIMS_AGENT_TIMEOUT`,
+`SUBNET_CLAIMS_AGENT_MAX_ITERS`, and `SUBNET_CLAIMS_AGENT_MAX_REPAIR_ATTEMPTS`.
+Every non-dry run records these values in `runtime_config.json` and includes
+the same redacted snapshot under `agent_output.json.metadata.runtime_config`.
+
 ## CLI Runtime
 
 Set `SUBNET_CLAIMS_AGENT_CLI_COMMAND` to a wrapper command. The runner appends:

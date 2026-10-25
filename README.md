@@ -388,6 +388,18 @@ python -m miner.agent_v1 \
   --output-dir miner/agent_v1/outputs/my_run
 ```
 
+Run the offline preflight before configuring a live provider:
+
+```bash
+python -m miner.agent_v1 \
+  --text examples/agent_v1_smoke.txt \
+  --output-dir /tmp/agent_v1_preflight \
+  --dry-run
+```
+
+The preflight materializes source/schema/skill inputs and a redacted
+`runtime_config.json`; it never invokes a model, wallet, or network runtime.
+
 The canonical structured output is:
 
 ```text

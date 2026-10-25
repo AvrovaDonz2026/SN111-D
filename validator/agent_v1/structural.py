@@ -67,6 +67,7 @@ def run_structural_checks(artifact_path: Path) -> tuple[dict[str, Any], Artifact
     trace_ids: list[str] = []
     _collect_trace_ids(artifact.trace, trace_ids)
     findings.extend(_check_unique_ids("trace_node", trace_ids))
+    findings.extend(_check_duplicate_claims(artifact))
 
     claim_ids = {c.claim_id for c in artifact.logic.claims}
     experiment_ids = {e.experiment_id for e in artifact.logic.experiments}
@@ -79,6 +80,17 @@ def run_structural_checks(artifact_path: Path) -> tuple[dict[str, Any], Artifact
             _finding("critical", "coverage", "Artifact contains no evidence records.", code="no_evidence_records", target_type="evidence")
         )
 
+    if artifact.logic.claims and not artifact.evidence.records:
+        findings.append(
+            _finding(
+                "critical",
+                "coverage",
+                "Every claim must have at least one evidence record.",
+                code="missing_claim_evidence",
+                target_type="logic",
+            )
+        )
+
     for claim in artifact.logic.claims:
         if not claim.statement.strip():
             findings.append(_missing_field("claim", claim.claim_id, "statement", "critical"))
@@ -86,9 +98,24 @@ def run_structural_checks(artifact_path: Path) -> tuple[dict[str, Any], Artifact
             findings.append(_missing_field("claim", claim.claim_id, "conditions", "major"))
         if not claim.falsification_criteria.strip():
             findings.append(_missing_field("claim", claim.claim_id, "falsification_criteria", "major"))
+        if not claim.evidence_ids:
+            findings.append(_missing_field("claim", claim.claim_id, "evidence_ids", "critical", code="missing_claim_evidence"))
         for evidence_id in claim.evidence_ids:
             if evidence_id not in evidence_ids:
                 findings.append(_unresolved("claim", claim.claim_id, "evidence_id", evidence_id, "critical"))
+            elif claim.claim_id not in next(e.linked_claim_ids for e in artifact.evidence.records if e.evidence_id == evidence_id):
+                findings.append(
+                    _finding(
+                        "critical",
+                        "cross_reference_resolution",
+                        f"Claim {claim.claim_id} references evidence {evidence_id} without a reverse linked_claim_ids reference.",
+                        target_type="claim",
+                        target_id=claim.claim_id,
+                        code="claim_evidence_link_not_bidirectional",
+                        field="evidence_ids",
+                        ref_id=evidence_id,
+                    )
+                )
         for experiment_id in claim.proof:
             if experiment_id not in experiment_ids:
                 findings.append(_unresolved("claim", claim.claim_id, "proof", experiment_id, "critical"))
@@ -110,9 +137,32 @@ def run_structural_checks(artifact_path: Path) -> tuple[dict[str, Any], Artifact
     for evidence in artifact.evidence.records:
         if not evidence.summary.strip():
             findings.append(_missing_field("evidence", evidence.evidence_id, "summary", "critical"))
+        if not evidence.linked_claim_ids:
+            findings.append(_missing_field("evidence", evidence.evidence_id, "linked_claim_ids", "critical", code="missing_evidence_claim"))
         for claim_id in evidence.linked_claim_ids:
             if claim_id not in claim_ids:
                 findings.append(_unresolved("evidence", evidence.evidence_id, "linked_claim_id", claim_id, "critical"))
+            elif evidence.evidence_id not in next(c.evidence_ids for c in artifact.logic.claims if c.claim_id == claim_id):
+                findings.append(
+                    _finding(
+                        "critical",
+                        "cross_reference_resolution",
+                        f"Evidence {evidence.evidence_id} references claim {claim_id} without a reverse evidence_ids reference.",
+                        target_type="evidence",
+                        target_id=evidence.evidence_id,
+                        code="evidence_claim_link_not_bidirectional",
+                        field="linked_claim_ids",
+                        ref_id=claim_id,
+                    )
+                )
+        for source_ref in evidence.source_refs:
+            if source_ref.quote is not None and not source_ref.quote.strip():
+                findings.append(_missing_field("evidence", evidence.evidence_id, "source_refs.quote", "major", code="empty_quote"))
+
+    for claim in artifact.logic.claims:
+        for source_ref in claim.sources:
+            if source_ref.quote is not None and not source_ref.quote.strip():
+                findings.append(_missing_field("claim", claim.claim_id, "sources.quote", "major", code="empty_quote"))
 
     trace_reference_ids = claim_ids | experiment_ids | evidence_ids | {c.concept_id for c in artifact.logic.concepts}
     _check_trace_refs(artifact.trace, trace_reference_ids, findings)
@@ -156,14 +206,21 @@ def _check_trace_refs(node, valid_reference_ids: set[str], findings: list[AgentV
         _check_trace_refs(child, valid_reference_ids, findings)
 
 
-def _missing_field(target_type: str, target_id: str, field_name: str, severity: str) -> AgentV1ValidationFinding:
+def _missing_field(
+    target_type: str,
+    target_id: str,
+    field_name: str,
+    severity: str,
+    *,
+    code: str = "missing_required_field",
+) -> AgentV1ValidationFinding:
     return _finding(
         severity,
         "required_field",
         f"{target_type} {target_id} has an empty required field: {field_name}.",
         target_type=target_type,
         target_id=target_id,
-        code="missing_required_field",
+        code=code,
         field=field_name,
     )
 
@@ -203,7 +260,38 @@ def _suggestion_for_code(code: str) -> str | None:
         "unresolved_reference": "Update the reference or add the missing target object.",
         "missing_required_field": "Populate the field with source-bounded content.",
         "no_evidence_records": "Add evidence records grounded in source refs.",
+        "missing_claim_evidence": "Link every claim to at least one evidence record in both directions.",
+        "missing_evidence_claim": "Link every evidence record to at least one claim in both directions.",
+        "empty_quote": "Include a non-empty verbatim quote for each source reference.",
+        "claim_evidence_link_not_bidirectional": "Add the claim ID to the evidence record's linked_claim_ids.",
+        "evidence_claim_link_not_bidirectional": "Add the evidence ID to the claim's evidence_ids.",
+        "duplicate_claim": "Remove duplicate claim statements or merge them under one stable claim ID.",
     }.get(code)
+
+
+def _check_duplicate_claims(artifact: Artifact) -> list[AgentV1ValidationFinding]:
+    seen: dict[str, str] = {}
+    findings: list[AgentV1ValidationFinding] = []
+    for claim in artifact.logic.claims:
+        normalized = " ".join(claim.statement.split()).casefold()
+        if not normalized:
+            continue
+        previous_id = seen.get(normalized)
+        if previous_id is not None:
+            findings.append(
+                _finding(
+                    "critical",
+                    "claim_uniqueness",
+                    f"Claim {claim.claim_id} duplicates claim {previous_id} after whitespace/case normalization.",
+                    target_type="claim",
+                    target_id=claim.claim_id,
+                    code="duplicate_claim",
+                    ref_id=previous_id,
+                )
+            )
+        else:
+            seen[normalized] = claim.claim_id
+    return findings
 
 
 def _number_findings(findings: list[AgentV1ValidationFinding]) -> list[AgentV1ValidationFinding]:

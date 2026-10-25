@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Literal
+from types import UnionType
+from typing import Any, Literal, Union, get_args, get_origin
 
 from pydantic import BaseModel, Field
 
@@ -116,3 +117,71 @@ class Artifact(BaseModel):
 
 
 TraceNode.model_rebuild()
+
+
+def unknown_field_diagnostics(
+    value: Any,
+    model_type: type[BaseModel] = Artifact,
+) -> list[dict[str, Any]]:
+    """Report keys that would be discarded by Pydantic's default extra policy.
+
+    The artifact models intentionally keep Pydantic's backwards-compatible
+    ``extra='ignore'`` behavior.  This helper makes that behavior observable
+    without changing model construction.  Arbitrary ``dict[str, Any]`` fields
+    such as ``metadata`` are treated as extension points and are not inspected.
+    """
+
+    diagnostics: list[dict[str, Any]] = []
+
+    def visit(current: Any, current_model: type[BaseModel], path: str) -> None:
+        if not isinstance(current, dict):
+            return
+
+        fields = current_model.model_fields
+        for key in current:
+            if key not in fields:
+                diagnostics.append(
+                    {
+                        "path": f"{path}.{key}",
+                        "code": "unknown_field",
+                        "field": key,
+                        "model": current_model.__name__,
+                        "message": f"Unknown field '{key}' would be ignored by {current_model.__name__}.",
+                    }
+                )
+
+        for field_name, field_info in fields.items():
+            if field_name not in current:
+                continue
+            child = current[field_name]
+            child_model = _nested_model_type(field_info.annotation)
+            if child_model is not None:
+                visit(child, child_model, f"{path}.{field_name}")
+                continue
+            item_model = _nested_list_item_model(field_info.annotation)
+            if item_model is not None and isinstance(child, list):
+                for index, item in enumerate(child):
+                    visit(item, item_model, f"{path}.{field_name}[{index}]")
+
+    visit(value, model_type, "$")
+    return diagnostics
+
+
+def _nested_model_type(annotation: Any) -> type[BaseModel] | None:
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return annotation
+    origin = get_origin(annotation)
+    if origin in (Union, UnionType):
+        for argument in get_args(annotation):
+            nested = _nested_model_type(argument)
+            if nested is not None:
+                return nested
+    return None
+
+
+def _nested_list_item_model(annotation: Any) -> type[BaseModel] | None:
+    if get_origin(annotation) is list:
+        arguments = get_args(annotation)
+        if arguments:
+            return _nested_model_type(arguments[0])
+    return None

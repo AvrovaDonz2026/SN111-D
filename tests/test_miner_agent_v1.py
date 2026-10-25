@@ -12,12 +12,14 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from miner.agent_v1.artifact import materialize_agent_artifact
+from miner.agent_v1.artifact_validator import validate_agent_artifact
 from miner.agent_v1.config import AgentV1Config
 from miner.agent_v1.ingest import (
     SOURCE_PAYLOAD_SCHEMA_VERSION,
     apply_paper_metadata_override,
     document_source_payload,
     ingest_pdf,
+    ingest_text,
 )
 from miner.agent_v1.provider import dspy_model_id
 from miner.agent_v1.runner import AgentV1Runner, _runtime_source_payload_path
@@ -128,6 +130,58 @@ def test_agent_v1_config_defaults_to_pdf_inspector(monkeypatch) -> None:
     config = AgentV1Config.from_env(Path.cwd())
 
     assert config.pdf_reader == "pdf-inspector"
+
+
+def test_agent_v1_config_snapshot_is_observable_and_redacted(monkeypatch) -> None:
+    monkeypatch.setenv("SUBNET_CLAIMS_AGENT_API_KEY", "should-not-appear")
+    monkeypatch.setenv("SUBNET_CLAIMS_AGENT_CLI_COMMAND", "echo --model test-model")
+    config = AgentV1Config.from_env(Path.cwd())
+
+    snapshot = config.observable_snapshot()
+
+    assert snapshot["model"] == config.model
+    assert snapshot["timeout_seconds"] == config.timeout_seconds
+    assert snapshot["cli_command_configured"] is True
+    assert "should-not-appear" not in json.dumps(snapshot)
+
+
+def test_agent_v1_dry_run_materializes_inputs_without_runtime(tmp_path: Path) -> None:
+    text_path = tmp_path / "paper.txt"
+    text_path.write_text("A local dry-run source.", encoding="utf-8")
+    config = AgentV1Config.from_env(Path.cwd())
+    config.skill_dir = Path("miner/agent_v1/skills/compiler")
+    run_dir = tmp_path / "dry-run"
+
+    prepared = AgentV1Runner(config).prepare_run_inputs(
+        ingest_text(text_path, max_chars=None),
+        output_dir=run_dir,
+        source_artifact_path=text_path,
+    )
+
+    assert prepared == run_dir.absolute()
+    assert (run_dir / "runtime_config.json").exists()
+    assert json.loads((run_dir / "dry_run_manifest.json").read_text()) == {
+        "status": "ready",
+        "runtime_invoked": False,
+        "input_source": "text",
+    }
+    assert (run_dir / "agent_schema.json").exists()
+    assert (run_dir / "data" / "paper.txt").exists()
+
+
+def test_agent_v1_dry_run_rejects_grobid_reader_case_insensitively(monkeypatch, tmp_path: Path) -> None:
+    from miner.agent_v1 import __main__ as agent_main
+
+    monkeypatch.setenv("SUBNET_CLAIMS_PDF_READER", "  GROBID  ")
+    monkeypatch.setattr(sys, "argv", ["agent_v1", "--pdf", str(tmp_path / "input.pdf"), "--output-dir", str(tmp_path / "out"), "--dry-run"])
+    monkeypatch.setattr(agent_main, "AgentV1Runner", lambda _config: object())
+
+    try:
+        agent_main.main()
+    except SystemExit as exc:
+        assert "offline" in str(exc)
+    else:
+        raise AssertionError("dry-run accepted GROBID reader from environment")
 
 
 def test_agent_v1_config_resolves_chutes_credentials(monkeypatch) -> None:
@@ -272,6 +326,7 @@ def test_miner_backend_artifact_upload_returns_manifest_only() -> None:
     )
     artifact = _valid_ara_payload()
     artifact["paper"]["paper_id"] = "paper_001"
+    artifact["metadata"]["submission_eligible"] = True
     source_payload = {"spans": [{"span_id": "paper_001-span-0001", "text": "source"}]}
 
     manifest = miner._post_batch_artifact(
@@ -319,13 +374,204 @@ def test_miner_uses_batch_scoped_artifact_id_for_canonical_task() -> None:
         task=task,
         paper=SimpleNamespace(title="Paper", paper_url="https://example.test/paper.pdf", source_sha256="sha"),
         paper_id="paper_001",
-        extraction={"paper": {"paper_id": "paper_001"}, "logic": {"claims": []}},
+        extraction={"paper": {"paper_id": "paper_001"}, "logic": {"claims": []}, "metadata": {"submission_eligible": True}},
         source_payload={"spans": []},
     )
 
     assert manifest["artifact_id"] == "artifact_batch_001_uid_9_paper_001"
     assert miner.backend_client.payload["metadata"]["artifact_scope"] == "batch"
     assert miner.backend_client.payload["metadata"]["collector_run_id"] == "run_002"
+
+
+def test_miner_does_not_upload_blocked_agent_artifact() -> None:
+    class FakeBackend:
+        def __init__(self) -> None:
+            self.payloads = []
+
+        def post_miner_artifact(self, payload):
+            self.payloads.append(payload)
+            return payload
+
+    miner = object.__new__(ClaimsMiner)
+    miner.backend_client = FakeBackend()
+    miner.uid = 9
+    miner.wallet = SimpleNamespace(hotkey=SimpleNamespace(ss58_address="hotkey_9"))
+    miner.config = SimpleNamespace(claims_pipeline="agent_v1", claims_subtensor_network_arg="test")
+    task = ClaimsTask.from_dict(
+        {
+            "task_id": "task_001",
+            "run_id": "run_001",
+            "batch_id": "batch_001",
+            "network": "testnet",
+            "paper_id": "paper_001",
+        }
+    )
+
+    try:
+        miner._post_batch_artifact(
+            task=task,
+            paper=SimpleNamespace(title="Paper", paper_url="", source_sha256="sha"),
+            paper_id="paper_001",
+            extraction={"metadata": {"submission_eligible": False}},
+            source_payload=None,
+        )
+    except RuntimeError as exc:
+        assert "submission gate blocked" in str(exc)
+    else:
+        raise AssertionError("blocked artifact was accepted for upload")
+    assert miner.backend_client.payloads == []
+
+
+def test_miner_does_not_upload_agent_artifact_without_submission_eligibility() -> None:
+    class FakeBackend:
+        def __init__(self) -> None:
+            self.payloads = []
+
+        def post_miner_artifact(self, payload):
+            self.payloads.append(payload)
+            return payload
+
+    miner = object.__new__(ClaimsMiner)
+    miner.backend_client = FakeBackend()
+    miner.uid = 9
+    miner.wallet = SimpleNamespace(hotkey=SimpleNamespace(ss58_address="hotkey_9"))
+    miner.config = SimpleNamespace(claims_pipeline="agent_v1", claims_subtensor_network_arg="test")
+    task = ClaimsTask.from_dict(
+        {
+            "task_id": "task_001",
+            "run_id": "run_001",
+            "batch_id": "batch_001",
+            "network": "testnet",
+            "paper_id": "paper_001",
+        }
+    )
+
+    try:
+        miner._post_batch_artifact(
+            task=task,
+            paper=SimpleNamespace(title="Paper", paper_url="", source_sha256="sha"),
+            paper_id="paper_001",
+            extraction={"paper": {"paper_id": "paper_001"}, "logic": {"claims": []}, "metadata": {}},
+            source_payload=None,
+        )
+    except RuntimeError as exc:
+        assert "submission gate blocked" in str(exc)
+    else:
+        raise AssertionError("artifact without explicit eligibility was accepted for upload")
+    assert miner.backend_client.payloads == []
+
+
+def test_miner_ignores_malformed_agent_v1_cache(tmp_path: Path) -> None:
+    class Logger:
+        def warning(self, _message):
+            return None
+
+        def info(self, _message):
+            return None
+
+    miner = object.__new__(ClaimsMiner)
+    miner.config = SimpleNamespace(claims_output_dir=tmp_path, claims_pipeline="agent_v1")
+    miner.bt_logging = Logger()
+    (tmp_path / ".cache").mkdir()
+    (tmp_path / ".cache" / "bad.json").write_text(json.dumps({"logic": {"claims": []}}), encoding="utf-8")
+
+    assert miner._read_cached_extraction("bad") is None
+
+
+def test_miner_ignores_agent_v1_cache_with_non_mapping_metadata(tmp_path: Path) -> None:
+    class Logger:
+        def warning(self, _message):
+            return None
+
+        def info(self, _message):
+            return None
+
+    miner = object.__new__(ClaimsMiner)
+    miner.config = SimpleNamespace(claims_output_dir=tmp_path, claims_pipeline="agent_v1")
+    miner.bt_logging = Logger()
+    (tmp_path / ".cache").mkdir()
+    (tmp_path / ".cache" / "bad-metadata.json").write_text(
+        json.dumps(
+            {
+                "paper": {"paper_id": "paper-001"},
+                "logic": {"claims": []},
+                "evidence": {"records": []},
+                "metadata": ["submission_eligible", False],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert miner._read_cached_extraction("bad-metadata") is None
+
+
+def test_miner_ignores_agent_v1_cache_without_explicit_submission_eligibility(tmp_path: Path) -> None:
+    class Logger:
+        def warning(self, _message):
+            return None
+
+        def info(self, _message):
+            return None
+
+    miner = object.__new__(ClaimsMiner)
+    miner.config = SimpleNamespace(claims_output_dir=tmp_path, claims_pipeline="agent_v1")
+    miner.bt_logging = Logger()
+    (tmp_path / ".cache").mkdir()
+    payload = _valid_ara_payload()
+    payload["metadata"].pop("submission_eligible", None)
+    (tmp_path / ".cache" / "missing-eligibility.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    assert miner._read_cached_extraction("missing-eligibility") is None
+
+
+def test_miner_accepts_fully_valid_agent_v1_cache(tmp_path: Path) -> None:
+    miner = ClaimsMiner.__new__(ClaimsMiner)
+    miner.config = SimpleNamespace(claims_output_dir=tmp_path, claims_pipeline="agent_v1")
+    miner.bt_logging = SimpleNamespace(warning=lambda *_args: None, info=lambda *_args: None)
+    (tmp_path / ".cache").mkdir()
+    payload = _valid_ara_payload()
+    payload["metadata"]["submission_eligible"] = True
+    (tmp_path / ".cache" / "valid.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    assert miner._read_cached_extraction("valid") == payload
+
+
+def test_miner_rejects_agent_v1_cache_with_unknown_or_invalid_fields(tmp_path: Path) -> None:
+    miner = ClaimsMiner.__new__(ClaimsMiner)
+    miner.config = SimpleNamespace(claims_output_dir=tmp_path, claims_pipeline="agent_v1")
+    miner.bt_logging = SimpleNamespace(warning=lambda *_args: None, info=lambda *_args: None)
+    cache_dir = tmp_path / ".cache"
+    cache_dir.mkdir()
+
+    unknown = _valid_ara_payload()
+    unknown["metadata"]["submission_eligible"] = True
+    unknown["logic"]["claims"][0]["unrecognized"] = "would be dropped"
+    (cache_dir / "unknown.json").write_text(json.dumps(unknown), encoding="utf-8")
+
+    malformed = _valid_ara_payload()
+    malformed["metadata"]["submission_eligible"] = True
+    malformed.pop("trace")
+    (cache_dir / "malformed.json").write_text(json.dumps(malformed), encoding="utf-8")
+
+    assert miner._read_cached_extraction("unknown") is None
+    assert miner._read_cached_extraction("malformed") is None
+
+
+def test_miner_ignores_agent_v1_cache_with_invalid_utf8(tmp_path: Path) -> None:
+    class Logger:
+        def warning(self, _message):
+            return None
+
+        def info(self, _message):
+            return None
+
+    miner = object.__new__(ClaimsMiner)
+    miner.config = SimpleNamespace(claims_output_dir=tmp_path, claims_pipeline="agent_v1")
+    miner.bt_logging = Logger()
+    (tmp_path / ".cache").mkdir()
+    (tmp_path / ".cache" / "invalid-utf8.json").write_bytes(b"{\xff\xfe")
+
+    assert miner._read_cached_extraction("invalid-utf8") is None
 
 
 def test_agent_v1_toolbox_validates_and_submits_artifact(tmp_path: Path) -> None:
@@ -403,8 +649,12 @@ def test_agent_v1_runner_uses_runtime_contract(monkeypatch, tmp_path: Path) -> N
     assert (output_dir / "skill_manifest.json").exists()
     assert (output_dir / "backend_manifest.json").exists()
     assert (output_dir / "agent_output.json").exists()
+    assert (output_dir / "submission_gate.json").exists()
     assert (output_dir / "PAPER.md").exists()
     assert json.loads((output_dir / "agent_validation_report.json").read_text())["issue_count"] == 0
+    assert artifact.metadata["validation_status"] == "valid"
+    assert artifact.metadata["submission_eligible"] is True
+    assert json.loads((output_dir / "submission_gate.json").read_text())["status"] == "eligible"
     assert artifact.metadata["runtime_metrics"]["elapsed_seconds"] == 1.25
     assert artifact.metadata["runtime_metrics"]["token_usage"]["total_tokens"] == 15
     assert artifact.metadata["runtime_metrics"]["cost_usd"] == 0.001
@@ -417,6 +667,35 @@ def test_agent_v1_runner_uses_runtime_contract(monkeypatch, tmp_path: Path) -> N
     limited_payload = json.loads((output_dir / "extraction_source_payload.json").read_text(encoding="utf-8"))
     assert limited_payload["source_integrity"]["truncated"] is True
     assert archived_payload == full_payload
+
+
+def test_agent_v1_runner_marks_exhausted_repairs_as_blocked(monkeypatch, tmp_path: Path) -> None:
+    text_path = tmp_path / "paper.txt"
+    text_path.write_text("A local source for an invalid candidate.", encoding="utf-8")
+    output_dir = tmp_path / "run"
+    config = AgentV1Config.from_env(Path.cwd())
+    config.max_repair_attempts = 2
+    config.skill_dir = Path("miner/agent_v1/skills/compiler")
+
+    class AlwaysInvalidRuntime:
+        runtime_name = "fake"
+
+        def run_skill(self, *, skill_pack, run_dir, request):
+            payload = _valid_ara_payload()
+            payload["logic"]["claims"] = []
+            (run_dir / request.expected_output_path).write_text(json.dumps(payload), encoding="utf-8")
+            return AgentResult(output_path=run_dir / request.expected_output_path, manifest={}, stdout="", stderr="")
+
+    monkeypatch.setattr("miner.agent_v1.runner.build_agent_runtime", lambda _config: AlwaysInvalidRuntime())
+
+    artifact = AgentV1Runner(config).run_from_text(text_path, output_dir=output_dir)
+
+    gate = json.loads((output_dir / "submission_gate.json").read_text(encoding="utf-8"))
+    assert artifact.metadata["validation_status"] == "invalid"
+    assert artifact.metadata["submission_eligible"] is False
+    assert gate["status"] == "blocked"
+    assert gate["issue_count"] > 0
+    assert "missing" in gate["issue_codes"]
 
 
 def test_file_agent_runtime_receives_complete_source_payload() -> None:
@@ -673,7 +952,7 @@ def test_miner_batch_task_returns_one_article_per_paper(monkeypatch, tmp_path: P
     def fake_run_task(paper_task, *, cache_key, validator_hotkey):
         calls.append(paper_task.paper_id)
         return (
-            {"paper": {"paper_id": paper_task.paper_id}, "logic": {"claims": []}, "metadata": {"cache_key": cache_key}},
+            {"paper": {"paper_id": paper_task.paper_id}, "logic": {"claims": []}, "metadata": {"cache_key": cache_key, "submission_eligible": True}},
             {"paper": {"paper_id": paper_task.paper_id}, "spans": []},
         )
 
@@ -734,6 +1013,51 @@ def test_miner_coalesces_duplicate_in_flight_paper_work() -> None:
 
     assert calls == 1
     assert [result[0]["paper"]["paper_id"] for result in results] == ["paper_1", "paper_1"]
+
+
+def test_miner_ignores_unusable_agent_v1_source_payload_cache(tmp_path: Path) -> None:
+    miner = ClaimsMiner.__new__(ClaimsMiner)
+    miner.config = SimpleNamespace(
+        claims_pipeline="agent_v1",
+        claims_timeout=2,
+        claims_output_dir=tmp_path,
+    )
+    miner.bt_logging = SimpleNamespace(
+        info=lambda *_args, **_kwargs: None,
+        warning=lambda *_args, **_kwargs: None,
+    )
+    cache_key = "invalid-source-cache"
+    extraction = {
+        "paper": {"paper_id": "paper_1"},
+        "logic": {"claims": []},
+        "evidence": {"records": []},
+        "metadata": {"submission_eligible": True},
+    }
+    cache_dir = tmp_path / ".cache"
+    cache_dir.mkdir()
+    miner._cache_path(cache_key).write_text(json.dumps(extraction), encoding="utf-8")
+    miner._source_payload_cache_path(cache_key).write_text(json.dumps({}), encoding="utf-8")
+    calls = 0
+
+    def fake_run_task(task, *, cache_key, validator_hotkey):
+        nonlocal calls
+        calls += 1
+        return extraction, {"spans": [{"span_id": "s1", "paper_id": "paper_1", "text": "source"}]}
+
+    miner._run_task = fake_run_task
+    task = ClaimsTask.from_dict(
+        {"task_id": "task_1", "paper_id": "paper_1", "paper_url": "https://example.test/1.pdf"}
+    )
+
+    result, source_payload = miner._run_task_coalesced(
+        task,
+        cache_key=cache_key,
+        validator_hotkey="validator",
+    )
+
+    assert calls == 1
+    assert result is extraction
+    assert source_payload["spans"][0]["text"] == "source"
 
 
 def test_miner_batch_forward_keeps_top_level_payload_compact(monkeypatch) -> None:
@@ -1019,3 +1343,112 @@ def test_materialize_agent_artifact_coerces_cli_structured_text_fields() -> None
 
     assert artifact.logic.experiments[0].setup == '{"condition": "Treatment arm", "population": "Study sample"}'
     assert artifact.logic.claims[0].conditions == '["Study sample conditions."]'
+
+
+def test_agent_v1_artifact_validator_covers_critical_structural_links() -> None:
+    cases = []
+
+    duplicate = _valid_ara_payload()
+    duplicate_claim = dict(duplicate["logic"]["claims"][0])
+    duplicate_claim["claim_id"] = "C02"
+    duplicate["logic"]["claims"].append(duplicate_claim)
+    cases.append((duplicate, "duplicate_claim"))
+
+    claim_without_evidence = _valid_ara_payload()
+    claim_without_evidence["logic"]["claims"][0]["evidence_ids"] = []
+    cases.append((claim_without_evidence, "missing_claim_evidence"))
+
+    evidence_without_claim = _valid_ara_payload()
+    evidence_without_claim["evidence"]["records"][0]["linked_claim_ids"] = []
+    cases.append((evidence_without_claim, "missing_evidence_claim"))
+
+    missing_evidence_reverse = _valid_ara_payload()
+    second_claim = dict(missing_evidence_reverse["logic"]["claims"][0])
+    second_claim.update(claim_id="C02", statement="A separate claim without its reverse evidence link.")
+    missing_evidence_reverse["logic"]["claims"].append(second_claim)
+    missing_evidence_reverse["evidence"]["records"][0]["linked_claim_ids"] = ["C02"]
+    cases.append((missing_evidence_reverse, "claim_evidence_link_not_bidirectional"))
+
+    missing_claim_reverse = _valid_ara_payload()
+    second_evidence = dict(missing_claim_reverse["evidence"]["records"][0])
+    second_evidence.update(evidence_id="EV02", linked_claim_ids=["C01"])
+    missing_claim_reverse["evidence"]["records"].append(second_evidence)
+    cases.append((missing_claim_reverse, "evidence_claim_link_not_bidirectional"))
+
+    for payload, expected_code in cases:
+        artifact = materialize_agent_artifact(payload)
+        assert expected_code in {issue["code"] for issue in validate_agent_artifact(artifact)}
+
+
+def test_agent_v1_artifact_validator_allows_shared_evidence() -> None:
+    payload = _valid_ara_payload()
+    second_claim = dict(payload["logic"]["claims"][0])
+    second_claim.update(
+        claim_id="C02",
+        statement="A distinct claim supported by the same evidence.",
+        evidence_ids=["EV01"],
+    )
+    payload["logic"]["claims"].append(second_claim)
+    payload["evidence"]["records"][0]["linked_claim_ids"].append("C02")
+
+    assert validate_agent_artifact(materialize_agent_artifact(payload)) == []
+
+
+def test_agent_v1_runner_blocks_duplicate_claim_submission(monkeypatch, tmp_path: Path) -> None:
+    text_path = tmp_path / "paper.txt"
+    text_path.write_text("A local source for duplicate claims.", encoding="utf-8")
+    output_dir = tmp_path / "run"
+    config = AgentV1Config.from_env(Path.cwd())
+    config.max_repair_attempts = 1
+    config.skill_dir = Path("miner/agent_v1/skills/compiler")
+
+    class DuplicateClaimRuntime:
+        runtime_name = "fake"
+
+        def run_skill(self, *, skill_pack, run_dir, request):
+            payload = _valid_ara_payload()
+            duplicate_claim = dict(payload["logic"]["claims"][0])
+            duplicate_claim["claim_id"] = "C02"
+            payload["logic"]["claims"].append(duplicate_claim)
+            (run_dir / request.expected_output_path).write_text(json.dumps(payload), encoding="utf-8")
+            return AgentResult(output_path=run_dir / request.expected_output_path, manifest={}, stdout="", stderr="")
+
+    monkeypatch.setattr("miner.agent_v1.runner.build_agent_runtime", lambda _config: DuplicateClaimRuntime())
+
+    artifact = AgentV1Runner(config).run_from_text(text_path, output_dir=output_dir)
+    gate = json.loads((output_dir / "submission_gate.json").read_text(encoding="utf-8"))
+
+    assert artifact.metadata["submission_eligible"] is False
+    assert gate["status"] == "blocked"
+    assert "duplicate_claim" in gate["issue_codes"]
+
+
+def test_agent_v1_runner_blocks_unknown_top_level_and_nested_fields(monkeypatch, tmp_path: Path) -> None:
+    for index, path in enumerate(("extra_top", "extra_nested")):
+        text_path = tmp_path / f"paper-{index}.txt"
+        text_path.write_text("A local source for schema validation.", encoding="utf-8")
+        output_dir = tmp_path / f"run-{index}"
+        config = AgentV1Config.from_env(Path.cwd())
+        config.max_repair_attempts = 1
+        config.skill_dir = Path("miner/agent_v1/skills/compiler")
+
+        class UnknownFieldRuntime:
+            runtime_name = "fake"
+
+            def run_skill(self, *, skill_pack, run_dir, request):
+                payload = _valid_ara_payload()
+                if path == "extra_top":
+                    payload["unexpected"] = "ignored by pydantic otherwise"
+                else:
+                    payload["logic"]["claims"][0]["sources"] = [{"source_id": "s1", "source_type": "paper", "surprise": True}]
+                (run_dir / request.expected_output_path).write_text(json.dumps(payload), encoding="utf-8")
+                return AgentResult(output_path=run_dir / request.expected_output_path, manifest={}, stdout="", stderr="")
+
+        monkeypatch.setattr("miner.agent_v1.runner.build_agent_runtime", lambda _config: UnknownFieldRuntime())
+        artifact = AgentV1Runner(config).run_from_text(text_path, output_dir=output_dir)
+        gate = json.loads((output_dir / "submission_gate.json").read_text(encoding="utf-8"))
+        report = json.loads((output_dir / "agent_validation_report.json").read_text(encoding="utf-8"))
+
+        assert artifact.metadata["submission_eligible"] is False
+        assert gate["status"] == "blocked"
+        assert any(issue["code"] == "unknown_field" for issue in report["issues"])

@@ -7,10 +7,24 @@ from typing import Any, Union, get_args, get_origin
 
 from pydantic import BaseModel
 
-from .artifact_models import Artifact
+from .artifact_models import Artifact, unknown_field_diagnostics
 
 
-def materialize_agent_artifact(raw: dict[str, Any], *, fallback_paper: dict[str, Any] | None = None) -> Artifact:
+class ArtifactSchemaError(ValueError):
+    """Raised by strict artifact materialization when unknown keys are found."""
+
+    def __init__(self, diagnostics: list[dict[str, Any]]) -> None:
+        self.diagnostics = diagnostics
+        details = "; ".join(f"{item['path']}: {item['message']}" for item in diagnostics)
+        super().__init__(f"Unknown artifact fields ({len(diagnostics)}): {details}")
+
+
+def materialize_agent_artifact(
+    raw: dict[str, Any],
+    *,
+    fallback_paper: dict[str, Any] | None = None,
+    strict: bool = False,
+) -> Artifact:
     payload = dict(raw) if isinstance(raw, dict) else {}
     if fallback_paper:
         paper = dict(fallback_paper)
@@ -47,6 +61,10 @@ def materialize_agent_artifact(raw: dict[str, Any], *, fallback_paper: dict[str,
     )
     _normalize_source_ref_roles(payload)
     _coerce_schema_text_fields(payload, Artifact)
+    if strict:
+        diagnostics = unknown_field_diagnostics(payload)
+        if diagnostics:
+            raise ArtifactSchemaError(diagnostics)
     return Artifact.model_validate(payload)
 
 

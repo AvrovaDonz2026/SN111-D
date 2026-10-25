@@ -1,0 +1,12 @@
+{
+  "ara_version": "1.0",
+  "paper": {"paper_id": "fixture-paper", "title": "Fixture study", "claims_summary": ["Claim one", "Claim two", "Claim three"]},
+  "logic": {"claims": [
+    {"claim_id": "C1", "statement": "Treatment improves recovery.", "conditions": "In the fixture cohort.", "status": "supported", "falsification_criteria": "No improvement.", "proof": ["E1"], "evidence_ids": ["EV1"], "sources": [{"source_id": "S1", "source_type": "span", "span_ids": ["p1"], "role": "result"}]},
+    {"claim_id": "C1", "statement": " Treatment improves   recovery. ", "conditions": "", "status": "supported", "falsification_criteria": "No improvement.", "proof": ["E1"], "evidence_ids": ["EV_missing"], "sources": []}
+  ], "experiments": [{"experiment_id": "E1", "title": "Test one", "verifies": ["C1"], "setup": "setup", "procedure": "procedure", "expected_outcome": "outcome", "evidence_ids": ["EV1"]}]},
+  "evidence": {"records": [{"evidence_id": "EV1", "title": "E1", "role": "support", "summary": "Observed improvement.", "source_refs": [{"source_id": "S1", "source_type": "span", "span_ids": ["p1"], "role": "result"}], "linked_claim_ids": ["C1"]}]},
+  "trace": {"node_id": "Q0", "node_type": "question", "summary": "Fixture question", "evidence": ["C1"], "children": []},
+  "src": {"environment": ["fixture"], "artifacts": []},
+  "metadata": {}
+}

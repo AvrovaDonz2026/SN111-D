@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 from validator.agent_v1.config import AgentV1ValidatorConfig
-from validator.agent_v1.grounding import run_grounding_checks
+from validator.agent_v1.grounding import _grounding_tokens, run_grounding_checks
 from validator.agent_v1.models import AgentV1ValidationFinding, RigorAgentResult
 from validator.agent_v1.reference_client import (
     BackendBackedReferenceMinerClient,
@@ -31,15 +31,175 @@ def test_validator_agent_v1_structural_and_grounding_clean(tmp_path: Path) -> No
     assert grounding_findings == []
 
 
+def test_structural_checks_require_bidirectional_claim_evidence_links(tmp_path: Path) -> None:
+    payload = _valid_artifact()
+    payload["evidence"]["records"][0]["linked_claim_ids"] = []
+    artifact_path = _write_json(tmp_path / "agent_output.json", payload)
+
+    _, artifact, findings = run_structural_checks(artifact_path)
+
+    assert artifact is not None
+    assert {finding.metadata["code"] for finding in findings} >= {
+        "missing_evidence_claim",
+        "claim_evidence_link_not_bidirectional",
+    }
+
+
+def test_structural_checks_flag_missing_claim_evidence_and_duplicate_claim(tmp_path: Path) -> None:
+    payload = _valid_artifact()
+    claim = dict(payload["logic"]["claims"][0])
+    claim.update(
+        claim_id="C02",
+        statement="  TREATMENT A REDUCED MEDIAN RECOVERY TIME FROM 10 DAYS TO 7 DAYS. ",
+        evidence_ids=["EV02"],
+    )
+    payload["logic"]["claims"].append(claim)
+    payload["evidence"]["records"].append(
+        {**payload["evidence"]["records"][0], "evidence_id": "EV02", "linked_claim_ids": ["C02"]}
+    )
+    artifact_path = _write_json(tmp_path / "agent_output.json", payload)
+
+    _, artifact, findings = run_structural_checks(artifact_path)
+
+    assert artifact is not None
+    assert "duplicate_claim" in {finding.metadata["code"] for finding in findings}
+    assert "collapsed_evidence_coverage" not in {finding.metadata["code"] for finding in findings}
+
+
+def test_structural_checks_allow_distinct_claims_to_share_evidence(tmp_path: Path) -> None:
+    payload = _valid_artifact()
+    shared_claim = dict(payload["logic"]["claims"][0])
+    shared_claim.update(
+        claim_id="C02",
+        statement="Treatment A improved the reported outcome.",
+        evidence_ids=["EV01"],
+    )
+    payload["logic"]["claims"].append(shared_claim)
+    payload["evidence"]["records"][0]["linked_claim_ids"] = ["C01", "C02"]
+    artifact_path = _write_json(tmp_path / "agent_output.json", payload)
+
+    _, artifact, findings = run_structural_checks(artifact_path)
+
+    assert artifact is not None
+    assert findings == []
+
+
+def test_structural_checks_flag_empty_evidence_and_explicit_empty_quote(tmp_path: Path) -> None:
+    payload = _valid_artifact()
+    payload["logic"]["claims"][0]["evidence_ids"] = []
+    payload["evidence"]["records"][0]["source_refs"][0]["quote"] = "  "
+    artifact_path = _write_json(tmp_path / "agent_output.json", payload)
+
+    _, artifact, findings = run_structural_checks(artifact_path)
+
+    assert artifact is not None
+    assert {finding.metadata["code"] for finding in findings} >= {"missing_claim_evidence", "empty_quote"}
+
+
 def test_validator_agent_v1_grounding_does_not_semantically_grade_quotes(tmp_path: Path) -> None:
     payload = _valid_artifact()
-    payload["logic"]["claims"][0]["sources"][0]["quote"] = "Treatment doubled recovery speed."
+    # The wording is semantically wrong, but it is still a literal excerpt from the cited span.
+    payload["logic"]["claims"][0]["sources"][0]["quote"] = "randomized study of 120 participants"
     artifact_path = _write_json(tmp_path / "agent_output.json", payload)
     _, artifact, structural_findings = run_structural_checks(artifact_path)
     grounding_findings = run_grounding_checks(artifact, _source_payload())
 
     assert structural_findings == []
     assert grounding_findings == []
+
+
+def test_validator_agent_v1_grounding_flags_quote_outside_referenced_span(tmp_path: Path) -> None:
+    payload = _valid_artifact()
+    payload["logic"]["claims"][0]["sources"][0]["quote"] = "Treatment doubled recovery speed."
+    artifact_path = _write_json(tmp_path / "agent_output.json", payload)
+    _, artifact, _ = run_structural_checks(artifact_path)
+
+    findings = run_grounding_checks(artifact, _source_payload())
+
+    assert [finding.metadata["code"] for finding in findings] == ["quote_not_in_source_span"]
+
+
+def test_validator_agent_v1_grounding_accepts_quote_across_referenced_spans(tmp_path: Path) -> None:
+    payload = _valid_artifact()
+    payload["logic"]["claims"][0]["statement"] = "The intervention reduced mortality by 20%."
+    for source_ref in _all_source_refs(payload):
+        source_ref.update(
+            span_ids=["paper-span-1", "paper-span-2"],
+            quote="intervention reduced mortality by 20%.",
+        )
+    source = {
+        "spans": [
+            {"span_id": "paper-span-1", "text": "The intervention reduced"},
+            {"span_id": "paper-span-2", "text": "mortality by 20%."},
+        ]
+    }
+    artifact_path = _write_json(tmp_path / "agent_output.json", payload)
+    _, artifact, _ = run_structural_checks(artifact_path)
+
+    assert run_grounding_checks(artifact, source) == []
+
+
+def test_validator_agent_v1_grounding_checks_claim_numbers_against_connected_sources(tmp_path: Path) -> None:
+    payload = _valid_artifact()
+    payload["logic"]["claims"][0]["statement"] = "Treatment A reduced recovery time from 10 days to 6 days."
+    artifact_path = _write_json(tmp_path / "agent_output.json", payload)
+    _, artifact, _ = run_structural_checks(artifact_path)
+
+    findings = run_grounding_checks(artifact, _source_payload())
+
+    numeric_findings = [finding for finding in findings if finding.metadata["code"] == "claim_number_not_in_source"]
+    assert len(numeric_findings) == 1
+    assert numeric_findings[0].metadata["numbers"] == ["6"]
+
+
+def test_validator_agent_v1_grounding_keeps_percent_units_distinct(tmp_path: Path) -> None:
+    payload = _valid_artifact()
+    payload["logic"]["claims"][0]["statement"] = "Treatment A improved recovery by 25%."
+    for source_ref in _all_source_refs(payload):
+        source_ref["quote"] = "Treatment A improved recovery by 25 participants."
+    source_payload = {
+        "spans": [
+            {"span_id": "paper-span-1", "text": "Treatment A improved recovery by 25 participants."}
+        ]
+    }
+    artifact_path = _write_json(tmp_path / "agent_output.json", payload)
+    _, artifact, _ = run_structural_checks(artifact_path)
+
+    findings = run_grounding_checks(artifact, source_payload)
+    assert any(finding.metadata["code"] == "claim_number_not_in_source" for finding in findings)
+
+
+def test_grounding_tokens_keep_sentence_final_percent_distinct_from_number() -> None:
+    assert _grounding_tokens("25%.") == [("percent:25", "25%")]
+    assert _grounding_tokens("25 participants") == [("number:25", "25")]
+
+
+def test_validator_agent_v1_grounding_treats_dates_and_versions_as_whole_tokens(tmp_path: Path) -> None:
+    payload = _valid_artifact()
+    payload["logic"]["claims"][0]["statement"] = "The protocol version v1.2.3 was used on 2024-10-25."
+    for source_ref in _all_source_refs(payload):
+        source_ref["quote"] = "The protocol version v1.2.3 was used on 2024-10-25."
+    source = {
+        "spans": [
+            {
+                "span_id": "paper-span-1",
+                "text": "The protocol version v1.2.3 was used on 2024-10-25.",
+            }
+        ]
+    }
+    artifact_path = _write_json(tmp_path / "agent_output.json", payload)
+    _, artifact, _ = run_structural_checks(artifact_path)
+
+    assert run_grounding_checks(artifact, source) == []
+
+
+def test_validator_agent_v1_grounding_accepts_numbers_in_cited_span_even_with_wrong_semantics(tmp_path: Path) -> None:
+    payload = _valid_artifact()
+    payload["logic"]["claims"][0]["statement"] = "Treatment A increased recovery time from 10 days to 7 days in 120 participants."
+    artifact_path = _write_json(tmp_path / "agent_output.json", payload)
+    _, artifact, _ = run_structural_checks(artifact_path)
+
+    assert run_grounding_checks(artifact, _source_payload()) == []
 
 
 def test_validator_agent_v1_grounding_flags_missing_span_ids(tmp_path: Path) -> None:
@@ -201,7 +361,7 @@ def test_validator_agent_v1_runner_accepts_precomputed_batched_rigor(monkeypatch
 
 def test_validator_agent_v1_llm_validation_reports_semantic_grounding_findings(monkeypatch, tmp_path: Path) -> None:
     payload = _valid_artifact()
-    payload["logic"]["claims"][0]["sources"][0]["quote"] = "Treatment A shortened recovery duration in the randomized trial."
+    payload["logic"]["claims"][0]["sources"][0]["quote"] = "randomized study of 120 participants"
     artifact_path = _write_json(tmp_path / "agent_output.json", payload)
     source_path = _write_json(tmp_path / "source_payload.json", _source_payload())
     output_dir = tmp_path / "validator"
@@ -308,7 +468,7 @@ def test_validator_agent_v1_llm_validation_keeps_direct_llm_grounding_findings(
     monkeypatch, tmp_path: Path
 ) -> None:
     payload = _valid_artifact()
-    payload["logic"]["claims"][0]["sources"][0]["quote"] = "Treatment A shortened recovery duration in the randomized trial."
+    payload["logic"]["claims"][0]["sources"][0]["quote"] = "randomized study of 120 participants"
     artifact_path = _write_json(tmp_path / "agent_output.json", payload)
     source_path = _write_json(tmp_path / "source_payload.json", _source_payload())
     output_dir = tmp_path / "validator"
@@ -591,6 +751,16 @@ def _source_ref() -> dict:
         "quote": "Treatment A reduced median recovery time from 10 days to 7 days",
         "role": "result",
     }
+
+
+def _all_source_refs(payload: dict) -> list[dict]:
+    """Return every artifact source ref so fixture mutations stay internally consistent."""
+    return [
+        *payload["logic"]["claims"][0]["sources"],
+        *payload["logic"]["experiments"][0]["source_refs"],
+        *payload["evidence"]["records"][0]["source_refs"],
+        payload["trace"]["source_refs"][0],
+    ]
 
 
 def _valid_artifact() -> dict:

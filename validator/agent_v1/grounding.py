@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
 from typing import Any
 
@@ -28,11 +29,12 @@ def run_grounding_checks(artifact: Artifact | None, source_payload: dict[str, An
                 )
             ]
         )
-    span_ids = {
-        str(span.get("span_id"))
+    spans = {
+        str(span.get("span_id")): str(span.get("text") or "")
         for span in source_payload.get("spans", []) or []
         if span.get("span_id")
     }
+    span_ids = set(spans)
     findings: list[AgentV1ValidationFinding] = []
 
     for claim in artifact.logic.claims:
@@ -48,7 +50,12 @@ def run_grounding_checks(artifact: Artifact | None, source_payload: dict[str, An
                     code="no_source_refs",
                 )
             )
-        findings.extend(_check_refs(source_refs, span_ids, "claim", claim.claim_id))
+        findings.extend(_check_refs(source_refs, spans, "claim", claim.claim_id))
+        linked_refs = list(source_refs)
+        for evidence in artifact.evidence.records:
+            if evidence.evidence_id in claim.evidence_ids or claim.claim_id in evidence.linked_claim_ids:
+                linked_refs.extend(evidence.source_refs)
+        findings.extend(_check_claim_numbers(claim.statement, linked_refs, spans, claim.claim_id))
 
     for evidence in artifact.evidence.records:
         if not evidence.source_refs:
@@ -62,17 +69,17 @@ def run_grounding_checks(artifact: Artifact | None, source_payload: dict[str, An
                     code="no_source_refs",
                 )
             )
-        findings.extend(_check_refs(evidence.source_refs, span_ids, "evidence", evidence.evidence_id))
+        findings.extend(_check_refs(evidence.source_refs, spans, "evidence", evidence.evidence_id))
 
     for experiment in artifact.logic.experiments:
-        findings.extend(_check_refs(experiment.source_refs, span_ids, "experiment", experiment.experiment_id))
+        findings.extend(_check_refs(experiment.source_refs, spans, "experiment", experiment.experiment_id))
 
     return _assign_finding_ids(findings)
 
 
 def _check_refs(
     source_refs: Iterable[SourceRef],
-    known_span_ids: set[str],
+    spans: dict[str, str],
     target_type: str,
     target_id: str,
 ) -> list[AgentV1ValidationFinding]:
@@ -101,7 +108,7 @@ def _check_refs(
                 )
             )
         for span_id in ref.span_ids:
-            if span_id not in known_span_ids:
+            if span_id not in spans:
                 findings.append(
                     _finding(
                         "critical",
@@ -114,7 +121,89 @@ def _check_refs(
                         span_id=span_id,
                     )
                 )
+        if ref.quote and ref.quote.strip():
+            quote = ref.quote.strip()
+            cited_texts = [spans[span_id] for span_id in ref.span_ids if span_id in spans]
+            joined_cited_text = " ".join(cited_texts)
+            if cited_texts and not _contains_text(joined_cited_text, quote):
+                findings.append(
+                    _finding(
+                        "major",
+                        "source_ref_quote",
+                        "Source ref quote does not appear in any referenced source span.",
+                        target_type,
+                        target_id,
+                        code="quote_not_in_source_span",
+                        ref_id=ref.source_id,
+                        span_ids=list(ref.span_ids),
+                        quote=quote,
+                    )
+                )
     return findings
+
+
+_NUMBER_RE = re.compile(r"(?<![\w.])[+-]?(?:\d+(?:,\d{3})*(?:\.\d+)?|\.\d+)(?:\s*%(?!\w)|(?![\w.%]))")
+_DATE_RE = re.compile(r"\b(?:\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4})\b")
+_VERSION_RE = re.compile(r"\b(?:v\s*\d+(?:\.\d+)+|version\s+\d+(?:\.\d+)+)\b", re.IGNORECASE)
+
+
+def _contains_text(text: str, needle: str) -> bool:
+    collapse = lambda value: " ".join(value.casefold().split())
+    return collapse(needle) in collapse(text)
+
+
+def _check_claim_numbers(statement: str, refs: list[SourceRef], spans: dict[str, str], claim_id: str) -> list[AgentV1ValidationFinding]:
+    statement_tokens = _grounding_tokens(statement)
+    if not statement_tokens:
+        return []
+    connected_text = " ".join(
+        text
+        for ref in refs
+        for text in ([ref.quote or ""] + [spans[span_id] for span_id in ref.span_ids if span_id in spans])
+    )
+    if not connected_text.strip():
+        return []
+    available = {token for token, _ in _grounding_tokens(connected_text)}
+    missing = [display for token, display in statement_tokens if token not in available]
+    if not missing:
+        return []
+    return [
+        _finding(
+            "major",
+            "claim_numeric_grounding",
+            "Claim contains numeric values absent from its connected source quotes and spans.",
+            "claim",
+            claim_id,
+            code="claim_number_not_in_source",
+            numbers=missing,
+        )
+    ]
+
+
+def _normalize_number(text: str) -> str:
+    return text.replace(",", "").replace(" ", "").lower()
+
+
+def _grounding_tokens(text: str) -> list[tuple[str, str]]:
+    """Extract load-bearing numeric/date/version tokens with unit-sensitive identity."""
+    tokens: list[tuple[str, str]] = []
+    masked = list(text)
+    protected = list(_DATE_RE.finditer(text)) + list(_VERSION_RE.finditer(text))
+    for match in sorted(protected, key=lambda item: item.start()):
+        raw = match.group(0)
+        kind = "version" if _VERSION_RE.fullmatch(raw) else "date"
+        canonical = " ".join(raw.casefold().split())
+        tokens.append((f"{kind}:{canonical}", raw))
+        for index in range(match.start(), match.end()):
+            masked[index] = " "
+    for match in _NUMBER_RE.finditer("".join(masked)):
+        raw = match.group(0).strip()
+        is_percent = raw.endswith("%")
+        numeric = raw[:-1].strip() if is_percent else raw
+        canonical = _normalize_number(numeric)
+        token = f"percent:{canonical}" if is_percent else f"number:{canonical}"
+        tokens.append((token, raw))
+    return tokens
 
 
 def _finding(

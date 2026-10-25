@@ -128,6 +128,19 @@ Important controls:
 - `SUBNET_CLAIMS_AGENT_SKILL_DIR`: compiler skill directory.
 - `SUBNET_CLAIMS_AGENT_CLI_COMMAND`: external runtime wrapper for `agent-cli`.
 
+Before a live run, use the offline preflight profile:
+
+```bash
+python -m miner.agent_v1 --text examples/agent_v1_smoke.txt \
+  --output-dir /tmp/agent_v1_preflight --dry-run
+```
+
+This parses the effective configuration, ingests the source, mounts and hashes
+the skill, and writes `runtime_config.json` plus `dry_run_manifest.json`. It
+does not require an API key and does not invoke a model, external agent, wallet,
+or network runtime. Runtime retry, repair, and timeout settings are recorded in
+the same config snapshot for post-run diagnosis.
+
 ## Skill Use
 
 The default compiler skill is vendored from the upstream ARA compiler skill at:

@@ -712,6 +712,15 @@ def test_parse_consensus_responses_requires_quotes_from_local_source() -> None:
 
 
 def test_consensus_provider_can_override_extraction_provider(monkeypatch, tmp_path) -> None:
+    # Isolate from local .env / uv-loaded CHA86 or OpenRouter consensus bases.
+    for name in (
+        "SUBNET_CLAIMS_CONSENSUS_API_BASE",
+        "CHA86_API_BASE",
+        "CHUTES_API_BASE",
+        "OPENROUTER_API_BASE",
+        "OPENAI_API_BASE",
+    ):
+        monkeypatch.delenv(name, raising=False)
     config = AgentV1Config.from_env(tmp_path)
     config.provider = "openrouter"
     config.model = "deepseek/deepseek-v4-flash"

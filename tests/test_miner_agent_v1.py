@@ -21,7 +21,8 @@ from miner.agent_v1.ingest import (
     ingest_pdf,
     ingest_text,
 )
-from miner.agent_v1.provider import dspy_model_id
+from miner.agent_v1.preflight import normalize_quote_text, quote_in_span, run_preflight
+from miner.agent_v1.provider import dspy_model_id, normalize_provider, provider_api_base, provider_api_key_env
 from miner.agent_v1.runner import AgentV1Runner, _runtime_source_payload_path
 from miner.agent_v1.runtime.base import AgentRequest, AgentResult
 from miner.agent_v1.runtime.langchain_agent import (
@@ -201,6 +202,25 @@ def test_agent_v1_config_resolves_chutes_credentials(monkeypatch) -> None:
     assert dspy_model_id(config.model, provider=config.provider, api_base=config.api_base) == (
         "openai/deepseek-ai/DeepSeek-V3.1"
     )
+
+
+def test_agent_v1_config_resolves_cha86_credentials(monkeypatch) -> None:
+    monkeypatch.setenv("SUBNET_CLAIMS_AGENT_PROVIDER", "cha86")
+    monkeypatch.setenv("SUBNET_CLAIMS_AGENT_MODEL", "gpt-6-luna")
+    monkeypatch.setenv("CHA86_API_KEY", "test-cha86-key")
+    monkeypatch.delenv("SUBNET_CLAIMS_AGENT_API_BASE", raising=False)
+    monkeypatch.delenv("SUBNET_CLAIMS_AGENT_API_KEY_ENV", raising=False)
+
+    config = AgentV1Config.from_env(Path.cwd())
+
+    assert config.provider == "cha86"
+    assert config.api_key_env == "CHA86_API_KEY"
+    assert config.api_key == "test-cha86-key"
+    assert config.api_base == "https://api.cha86.dev/v1"
+    assert normalize_provider(None, api_base=config.api_base) == "cha86"
+    assert provider_api_base("cha86") == "https://api.cha86.dev/v1"
+    assert provider_api_key_env("cha86") == "CHA86_API_KEY"
+    assert dspy_model_id(config.model, provider=config.provider, api_base=config.api_base) == "openai/gpt-6-luna"
 
 
 def test_dspy_chutes_model_keeps_explicit_litellm_route() -> None:
@@ -582,16 +602,19 @@ def test_agent_v1_toolbox_validates_and_submits_artifact(tmp_path: Path) -> None
     )
     (tmp_path / "agent_schema.json").write_text(json.dumps(agent_json_schema()), encoding="utf-8")
     toolbox = AgentToolbox(run_dir=tmp_path, skill_pack=skill_pack)
-    artifact_json = json.dumps(_valid_ara_payload())
+    artifact_json = json.dumps(_valid_ara_payload(span_id="s1"))
 
     validation = json.loads(toolbox.validate_agent_artifact(artifact_json))
     submit = json.loads(toolbox.submit_agent_artifact(artifact_json))
+    span = json.loads(toolbox.read_source_span("s1", neighbors=0))
 
     assert validation["issue_count"] == 0
     assert submit["accepted"] is True
     assert "Claims Agent V1 Structured Output" in toolbox.read_output_schema()
     assert (tmp_path / "agent_output.json").exists()
     assert "s1" in toolbox.search_source_text("improved")
+    assert span["span_id"] == "s1"
+    assert "treatment improved outcome" in span["normalized_text"]
 
 
 def test_agent_v1_runner_uses_runtime_contract(monkeypatch, tmp_path: Path) -> None:
@@ -615,7 +638,7 @@ def test_agent_v1_runner_uses_runtime_contract(monkeypatch, tmp_path: Path) -> N
             extraction_payload = json.loads((run_dir / request.source_payload_path).read_text(encoding="utf-8"))
             extraction_text = "".join(span["text"] for span in extraction_payload["spans"])
             assert extraction_text == early_source
-            payload = _valid_ara_payload()
+            payload = _grounded_payload_for_run(run_dir)
             (run_dir / request.expected_output_path).write_text(json.dumps(payload), encoding="utf-8")
             return AgentResult(
                 output_path=run_dir / request.expected_output_path,
@@ -650,6 +673,7 @@ def test_agent_v1_runner_uses_runtime_contract(monkeypatch, tmp_path: Path) -> N
     assert (output_dir / "backend_manifest.json").exists()
     assert (output_dir / "agent_output.json").exists()
     assert (output_dir / "submission_gate.json").exists()
+    assert (output_dir / "paper_metrics.json").exists()
     assert (output_dir / "PAPER.md").exists()
     assert json.loads((output_dir / "agent_validation_report.json").read_text())["issue_count"] == 0
     assert artifact.metadata["validation_status"] == "valid"
@@ -658,12 +682,17 @@ def test_agent_v1_runner_uses_runtime_contract(monkeypatch, tmp_path: Path) -> N
     assert artifact.metadata["runtime_metrics"]["elapsed_seconds"] == 1.25
     assert artifact.metadata["runtime_metrics"]["token_usage"]["total_tokens"] == 15
     assert artifact.metadata["runtime_metrics"]["cost_usd"] == 0.001
+    metrics = json.loads((output_dir / "paper_metrics.json").read_text(encoding="utf-8"))
+    assert metrics["artifact_valid"] is True
+    assert metrics["claim_count"] == 1
     full_payload = json.loads((output_dir / "source_payload.json").read_text(encoding="utf-8"))
     archived_payload = json.loads(
         (output_dir / "data" / "agent_v1_source_payload.json").read_text(encoding="utf-8")
     )
     assert late_source in "".join(span["text"] for span in full_payload["spans"])
     assert full_payload["source_integrity"]["truncated"] is False
+    assert "section_index" in full_payload
+    assert "extraction_quality" in full_payload
     limited_payload = json.loads((output_dir / "extraction_source_payload.json").read_text(encoding="utf-8"))
     assert limited_payload["source_integrity"]["truncated"] is True
     assert archived_payload == full_payload
@@ -1256,7 +1285,23 @@ def test_miner_returns_structured_consensus_source_failure(monkeypatch) -> None:
     assert json.loads(result.error)["schema"] == "claims_consensus_source_failure_v1"
 
 
-def _valid_ara_payload() -> dict:
+def _source_ref(span_id: str, quote: str = "Treatment improved outcome.") -> dict:
+    return {
+        "source_id": f"src-{span_id}",
+        "source_type": "span",
+        "span_ids": [span_id],
+        "quote": quote,
+        "role": "result",
+    }
+
+
+def _valid_ara_payload(
+    *,
+    span_id: str = "paper1-span-0001",
+    quote: str = "Treatment improved outcome.",
+    grounded: bool = True,
+) -> dict:
+    refs = [_source_ref(span_id, quote)] if grounded else []
     return {
         "paper": {
             "paper_id": "paper1",
@@ -1281,8 +1326,8 @@ def _valid_ara_payload() -> dict:
                     "proof": ["E01"],
                     "evidence_ids": ["EV01"],
                     "dependencies": [],
-                    "sources": [],
-                    "metadata": {},
+                    "sources": list(refs),
+                    "metadata": {"salience": "central"},
                 }
             ],
             "concepts": [],
@@ -1296,7 +1341,7 @@ def _valid_ara_payload() -> dict:
                     "expected_outcome": "Outcome improves.",
                     "evidence_ids": ["EV01"],
                     "run": "reported study",
-                    "source_refs": [],
+                    "source_refs": list(refs),
                 }
             ],
             "related_work": [],
@@ -1310,7 +1355,7 @@ def _valid_ara_payload() -> dict:
                     "role": "support",
                     "summary": "Treatment improved outcome.",
                     "evidence_method": "reported result",
-                    "source_refs": [],
+                    "source_refs": list(refs),
                     "linked_claim_ids": ["C01"],
                     "metadata": {},
                 }
@@ -1322,13 +1367,19 @@ def _valid_ara_payload() -> dict:
             "node_type": "question",
             "support_level": "inferred",
             "summary": "Does treatment improve outcome?",
-            "source_refs": [],
+            "source_refs": list(refs),
             "evidence": ["C01"],
             "children": [],
         },
         "src": {"environment": ["agent_v1 test"], "artifacts": []},
         "metadata": {},
     }
+
+
+def _grounded_payload_for_run(run_dir: Path, *, quote: str = "Treatment improved outcome") -> dict:
+    source = json.loads((run_dir / "source_payload.json").read_text(encoding="utf-8"))
+    span_id = str(source["spans"][0]["span_id"])
+    return _valid_ara_payload(span_id=span_id, quote=quote)
 
 
 def test_materialize_agent_artifact_coerces_cli_structured_text_fields() -> None:
@@ -1392,6 +1443,37 @@ def test_agent_v1_artifact_validator_allows_shared_evidence() -> None:
     payload["evidence"]["records"][0]["linked_claim_ids"].append("C02")
 
     assert validate_agent_artifact(materialize_agent_artifact(payload)) == []
+
+
+def test_agent_v1_preflight_rejects_ungrounded_quotes() -> None:
+    payload = _valid_ara_payload(span_id="span-1", quote="this quote is not in the paper")
+    artifact = materialize_agent_artifact(payload)
+    source_payload = {"spans": [{"span_id": "span-1", "text": "Treatment improved outcome in the sample."}]}
+
+    issues = run_preflight(artifact, source_payload=source_payload, require_source_grounding=True)
+    codes = {issue["code"] for issue in issues}
+
+    assert "quote_not_in_source_span" in codes
+    assert quote_in_span("Treatment improved", "Treatment improved outcome.")
+    assert "foobar" == normalize_quote_text("foo-\nbar")
+
+
+def test_agent_v1_preflight_accepts_grounded_artifact() -> None:
+    payload = _valid_ara_payload(span_id="span-1", quote="Treatment improved outcome")
+    artifact = materialize_agent_artifact(payload)
+    source_payload = {"spans": [{"span_id": "span-1", "text": "Treatment improved outcome in the sample."}]}
+
+    assert run_preflight(artifact, source_payload=source_payload, require_source_grounding=True) == []
+
+
+def test_agent_v1_section_index_infers_results_headers(tmp_path: Path) -> None:
+    path = tmp_path / "paper.txt"
+    path.write_text("# Results\n\nTreatment improved outcome in the trial.\n", encoding="utf-8")
+    document = ingest_text(path, max_chars=None)
+    payload = document_source_payload(document, max_chars=None)
+
+    assert "RESULTS" in payload["section_index"]["section_types_present"]
+    assert payload["extraction_quality"]["empty"] is False
 
 
 def test_agent_v1_runner_blocks_duplicate_claim_submission(monkeypatch, tmp_path: Path) -> None:

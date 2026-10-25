@@ -32,13 +32,18 @@ class AgentV1Config(BaseModel):
     max_tokens: int = Field(default=32768, ge=1)
     max_agent_iters: int = Field(default=4, ge=1)
     max_repair_attempts: int = Field(default=3, ge=1)
+    require_source_grounding: bool = True
+    experiment_version: str = "sn111d-preflight-v1"
     cli_command: list[str] = []
 
     @classmethod
     def from_env(cls, base_dir: Path | None = None) -> "AgentV1Config":
         resolved_base_dir = base_dir or Path(__file__).resolve().parents[2]
         package_dir = Path(__file__).resolve().parent
-        provider = normalize_provider(os.getenv("SUBNET_CLAIMS_AGENT_PROVIDER"))
+        provider = normalize_provider(
+            os.getenv("SUBNET_CLAIMS_AGENT_PROVIDER"),
+            api_base=os.getenv("SUBNET_CLAIMS_AGENT_API_BASE", ""),
+        )
         api_key_env = provider_api_key_env(
             provider,
             os.getenv("SUBNET_CLAIMS_AGENT_API_KEY_ENV"),
@@ -78,6 +83,9 @@ class AgentV1Config(BaseModel):
             max_tokens=int(os.getenv("SUBNET_CLAIMS_AGENT_MAX_TOKENS", "32768")),
             max_agent_iters=int(os.getenv("SUBNET_CLAIMS_AGENT_MAX_ITERS", "4")),
             max_repair_attempts=int(os.getenv("SUBNET_CLAIMS_AGENT_MAX_REPAIR_ATTEMPTS", "3")),
+            require_source_grounding=_env_flag("SUBNET_CLAIMS_REQUIRE_SOURCE_GROUNDING", default=True),
+            experiment_version=os.getenv("SUBNET_CLAIMS_EXPERIMENT_VERSION", "sn111d-preflight-v1").strip()
+            or "sn111d-preflight-v1",
             cli_command=shlex.split(os.getenv("SUBNET_CLAIMS_AGENT_CLI_COMMAND", "")),
         )
 
@@ -106,6 +114,8 @@ class AgentV1Config(BaseModel):
             "max_tokens": self.max_tokens,
             "max_agent_iters": self.max_agent_iters,
             "max_repair_attempts": self.max_repair_attempts,
+            "require_source_grounding": self.require_source_grounding,
+            "experiment_version": self.experiment_version,
             "cli_command_configured": bool(self.cli_command),
         }
 
@@ -117,3 +127,10 @@ def _pdf_reader_from_env() -> str:
         or os.getenv("CLAIMS_PDF_READER")
         or "pdf-inspector"
     )
+
+
+def _env_flag(name: str, *, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}

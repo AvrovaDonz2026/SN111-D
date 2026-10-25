@@ -15,7 +15,7 @@ from .runtime import AgentRequest, build_agent_runtime
 from .runtime.usage import merge_usage
 from .schema import AGENT_JSON_SCHEMA_FILENAME, agent_json_schema, write_agent_json_schema
 from .skillpack import load_skill_pack
-from .artifact_validator import validate_agent_artifact
+from .preflight import run_preflight
 
 
 logger = logging.getLogger(__name__)
@@ -79,7 +79,9 @@ class AgentV1Runner:
             skill_pack.manifest(),
         )
         self._write_config_snapshot(run_dir)
-        artifact, runtime_metrics = self._compile_with_repair(runtime, skill_pack, run_dir, document)
+        artifact, runtime_metrics = self._compile_with_repair(
+            runtime, skill_pack, run_dir, document, source_payload=source_payload
+        )
         schema_diagnostics = artifact.metadata.pop("_schema_diagnostics", [])
         artifact.metadata.update(
             {
@@ -90,12 +92,19 @@ class AgentV1Runner:
                 "runtime_metrics": runtime_metrics,
                 "skill_name": skill_pack.name,
                 "skill_sha256": skill_pack.sha256,
+                "experiment_version": self.config.experiment_version,
+                "prompt_version": "sn111-two-stage-v1",
+                "reader_version": document.raw_metadata.get("pdf_reader") or document.source_type,
                 "source_type": document.source_type,
                 "source_path": document.source_path,
                 "source_metadata": document.raw_metadata,
             }
         )
-        issues = validate_agent_artifact(artifact)
+        issues = run_preflight(
+            artifact,
+            source_payload=source_payload,
+            require_source_grounding=self.config.require_source_grounding,
+        )
         issues.extend(_unknown_field_issues(schema_diagnostics))
         validation_status = "valid" if not issues else "invalid"
         artifact.metadata.update(
@@ -103,12 +112,30 @@ class AgentV1Runner:
                 "validation_status": validation_status,
                 "validation_issue_count": len(issues),
                 "submission_eligible": not issues,
+                "grounding_error_count": sum(
+                    1
+                    for issue in issues
+                    if str(issue.get("code") or "").startswith(
+                        ("quote_", "missing_source", "no_source", "claim_number", "claim_qualifier")
+                    )
+                    or str(issue.get("code") or "") in {"missing_source_span", "missing_source_payload"}
+                ),
+                "claim_count": len(artifact.logic.claims),
+                "central_claim_count": sum(
+                    1 for claim in artifact.logic.claims if str(claim.metadata.get("salience") or "").lower() == "central"
+                ),
+                "supporting_claim_count": sum(
+                    1
+                    for claim in artifact.logic.claims
+                    if str(claim.metadata.get("salience") or "").lower() == "supporting"
+                ),
             }
         )
         write_agent_directory(run_dir, artifact)
         write_agent_validation_report(run_dir / "agent_validation_report.json", issues)
         self._write_submission_gate(run_dir, issues)
         self._write_source_payload(run_dir, source_payload)
+        self._write_paper_metrics(run_dir, artifact, runtime_metrics, issues)
         if source_artifact_path and source_artifact_path.exists():
             data_dir = run_dir / "data"
             data_dir.mkdir(parents=True, exist_ok=True)
@@ -151,6 +178,8 @@ class AgentV1Runner:
         skill_pack,
         run_dir: Path,
         document: InputDocument,
+        *,
+        source_payload: dict[str, Any],
     ) -> tuple[Artifact, dict[str, Any]]:
         feedback: dict[str, Any] = {}
         last_raw: dict[str, Any] = {}
@@ -177,18 +206,25 @@ class AgentV1Runner:
             last_raw = raw
             schema_diagnostics = unknown_field_diagnostics(raw)
             artifact = materialize_agent_artifact(raw, fallback_paper=document.paper.model_dump(mode="json"))
-            issues = validate_agent_artifact(artifact)
+            issues = run_preflight(
+                artifact,
+                source_payload=source_payload,
+                require_source_grounding=self.config.require_source_grounding,
+            )
             issues.extend(_unknown_field_issues(schema_diagnostics))
             if not issues:
                 return artifact, _runtime_metrics(manifests)
             feedback = {
-                "instruction": "Previous agent_v1 JSON failed deterministic validation. Return a full corrected JSON object, not a patch.",
+                "instruction": "Previous agent_v1 JSON failed deterministic preflight. Return a full corrected JSON object, not a patch.",
                 "attempt": attempt + 1,
                 "issues": issues,
                 "repair_requirements": [
                     "Fix every unresolved proof, evidence, verifies, and linked_claim reference.",
+                    "Every source quote must be a contiguous verbatim substring of the cited source span after PDF normalization.",
+                    "Use read_source_span(span_id) before rewriting quotes; do not paraphrase evidence.",
                     "If coverage is insufficient, add distinct source-grounded claims with their own proof experiments and evidence records.",
                     "Do not remove valid existing claims to satisfy coverage; expand and repair the artifact.",
+                    "Prefer local repairs of broken quotes/refs over regenerating an entirely different artifact.",
                 ],
             }
             logger.info("agent_v1 attempt %s produced %s validation issue(s)", attempt + 1, len(issues))
@@ -259,6 +295,41 @@ class AgentV1Runner:
         data_dir.mkdir(parents=True, exist_ok=True)
         (data_dir / "agent_v1_source_payload.json").write_text(
             json.dumps(source_payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+    def _write_paper_metrics(
+        self,
+        run_dir: Path,
+        artifact: Artifact,
+        runtime_metrics: dict[str, Any],
+        issues: list[dict[str, Any]],
+    ) -> None:
+        token_usage = runtime_metrics.get("token_usage") if isinstance(runtime_metrics.get("token_usage"), dict) else {}
+        payload = {
+            "paper_id": artifact.paper.paper_id,
+            "experiment_version": self.config.experiment_version,
+            "skill_sha256": artifact.metadata.get("skill_sha256"),
+            "prompt_version": artifact.metadata.get("prompt_version"),
+            "reader_version": artifact.metadata.get("reader_version"),
+            "model": self.config.model,
+            "provider": self.config.provider,
+            "runtime": self.config.runtime,
+            "elapsed_seconds": runtime_metrics.get("elapsed_seconds"),
+            "attempt_count": runtime_metrics.get("attempt_count"),
+            "token_usage": token_usage,
+            "cost_usd": runtime_metrics.get("cost_usd"),
+            "artifact_valid": not issues,
+            "submission_eligible": not issues,
+            "grounding_error_count": artifact.metadata.get("grounding_error_count"),
+            "claim_count": artifact.metadata.get("claim_count"),
+            "central_claim_count": artifact.metadata.get("central_claim_count"),
+            "supporting_claim_count": artifact.metadata.get("supporting_claim_count"),
+            "validation_issue_count": len(issues),
+            "issue_codes": sorted({str(issue.get("code") or "unknown") for issue in issues}),
+        }
+        (run_dir / "paper_metrics.json").write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
 

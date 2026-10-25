@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Callable
 
 from ..artifact import materialize_agent_artifact
-from ..artifact_validator import validate_agent_artifact
+from ..preflight import normalize_quote_text, run_preflight
 from ..skillpack import SkillPack
 
 
@@ -25,10 +25,16 @@ class AgentToolbox:
     def specs(self) -> list[ToolSpec]:
         return [
             ToolSpec("read_source_payload", "Read the full source payload JSON for this run.", self.read_source_payload),
+            ToolSpec(
+                "read_source_span",
+                "Read one source span by ID with page, neighbors, and normalized text.",
+                self.read_source_span,
+            ),
             ToolSpec("read_run_file", "Read a UTF-8 file inside the current run directory.", self.read_run_file),
             ToolSpec("write_run_file", "Write a UTF-8 file inside the current run directory.", self.write_run_file),
             ToolSpec("list_run_files", "List files inside the current run directory.", self.list_run_files),
             ToolSpec("search_source_text", "Search source span text for a case-insensitive query.", self.search_source_text),
+            ToolSpec("read_section_index", "Read the section/table/figure index for this paper.", self.read_section_index),
             ToolSpec("read_output_schema", "Read the JSON Schema for the required agent_output.json payload.", self.read_output_schema),
             ToolSpec("read_skill_resource", "Read a mounted skill resource by relative path.", self.read_skill_resource),
             ToolSpec("validate_agent_artifact", "Validate candidate agent JSON and return validation issues.", self.validate_agent_artifact),
@@ -62,6 +68,7 @@ class AgentToolbox:
                     {
                         "span_id": span.get("span_id"),
                         "section_name": span.get("section_name"),
+                        "section_type": span.get("section_type"),
                         "page": span.get("page"),
                         "text": text[:1200],
                     }
@@ -69,6 +76,51 @@ class AgentToolbox:
             if len(matches) >= limit:
                 break
         return json.dumps(matches, indent=2, ensure_ascii=False)
+
+    def read_source_span(self, span_id: str, neighbors: int = 1) -> str:
+        payload = json.loads(self.read_source_payload())
+        spans = [span for span in payload.get("spans", []) or [] if isinstance(span, dict)]
+        index = next((i for i, span in enumerate(spans) if str(span.get("span_id")) == span_id), None)
+        if index is None:
+            return self._tool_error("source_span_not_found", f"Unknown span_id: {span_id}")
+        radius = max(0, min(int(neighbors), 3))
+        start = max(0, index - radius)
+        end = min(len(spans), index + radius + 1)
+        target = spans[index]
+        text = str(target.get("text") or "")
+        return json.dumps(
+            {
+                "span_id": target.get("span_id"),
+                "page": target.get("page"),
+                "section_name": target.get("section_name"),
+                "section_type": target.get("section_type"),
+                "text": text,
+                "normalized_text": normalize_quote_text(text),
+                "neighbors": [
+                    {
+                        "span_id": neighbor.get("span_id"),
+                        "page": neighbor.get("page"),
+                        "section_type": neighbor.get("section_type"),
+                        "text": str(neighbor.get("text") or "")[:1500],
+                    }
+                    for neighbor in spans[start:end]
+                    if neighbor is not target
+                ],
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+
+    def read_section_index(self) -> str:
+        payload = json.loads(self.read_source_payload())
+        return json.dumps(
+            {
+                "section_index": payload.get("section_index") or {},
+                "extraction_quality": payload.get("extraction_quality") or {},
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
 
     def read_skill_resource(self, path: str) -> str:
         try:
@@ -86,7 +138,11 @@ class AgentToolbox:
         try:
             raw = json.loads(candidate_json)
             artifact = materialize_agent_artifact(raw)
-            issues = validate_agent_artifact(artifact)
+            source_payload = None
+            source_path = self.run_dir / "source_payload.json"
+            if source_path.exists():
+                source_payload = json.loads(source_path.read_text(encoding="utf-8"))
+            issues = run_preflight(artifact, source_payload=source_payload, require_source_grounding=True)
         except Exception as exc:
             issues = [{"path": "$", "code": "invalid_json_or_schema", "message": str(exc)}]
         return json.dumps({"issue_count": len(issues), "issues": issues}, indent=2, ensure_ascii=False)

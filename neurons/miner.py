@@ -26,6 +26,7 @@ from miner.agent_v1.ingest import (
     SOURCE_PAYLOAD_POLICY_VERSION,
     SOURCE_PAYLOAD_SCHEMA_VERSION,
 )
+from miner.agent_v1.preflight import run_preflight
 from miner.agent_v1.runner import AgentV1Runner
 from miner.v0.config import SectionContextV1Config
 from miner.v0.runner import SectionContextV1Runner
@@ -951,7 +952,8 @@ class ClaimsMiner:
             if not isinstance(metadata, dict) or metadata.get("submission_eligible") is not True:
                 self.bt_logging.warning(f"Ignoring agent_v1 extraction cache without explicit eligibility cache_key={cache_key[:12]}")
                 return None
-            if not _agent_v1_cached_artifact_is_valid(payload):
+            cached_source = self._read_cached_source_payload(cache_key)
+            if not _agent_v1_cached_artifact_is_valid(payload, source_payload=cached_source):
                 self.bt_logging.warning(f"Ignoring invalid agent_v1 extraction cache cache_key={cache_key[:12]}")
                 return None
         self.bt_logging.info(f"Returning cached Claims extraction for cache_key={cache_key[:12]}")
@@ -1038,7 +1040,11 @@ def _agent_v1_cache_shape_is_usable(payload: dict[str, Any]) -> bool:
     )
 
 
-def _agent_v1_cached_artifact_is_valid(payload: dict[str, Any]) -> bool:
+def _agent_v1_cached_artifact_is_valid(
+    payload: dict[str, Any],
+    *,
+    source_payload: dict[str, Any] | None = None,
+) -> bool:
     """Revalidate the full artifact before trusting an agent_v1 cache hit."""
     if unknown_field_diagnostics(payload):
         return False
@@ -1046,6 +1052,8 @@ def _agent_v1_cached_artifact_is_valid(payload: dict[str, Any]) -> bool:
         artifact = Artifact.model_validate(payload)
     except (TypeError, ValueError):
         return False
+    if source_payload is not None:
+        return not run_preflight(artifact, source_payload=source_payload, require_source_grounding=True)
     return not validate_agent_artifact(artifact)
 
 

@@ -132,10 +132,13 @@ def ingest_text(text_path: Path, *, max_chars: int | None) -> InputDocument:
 
 
 def document_source_payload(document: InputDocument, *, max_chars: int | None) -> dict[str, Any]:
-    spans = _truncate_spans(document.spans, max_chars=max_chars)
+    annotated = [_annotate_section(span) for span in document.spans]
+    spans = _truncate_spans(annotated, max_chars=max_chars)
     source_text = "\n\n".join(span.text for span in spans)
-    complete_text = "\n\n".join(span.text for span in document.spans)
-    truncated = len(spans) != len(document.spans) or source_text != complete_text
+    complete_text = "\n\n".join(span.text for span in annotated)
+    truncated = len(spans) != len(annotated) or source_text != complete_text
+    section_index = build_section_index(spans)
+    extraction_quality = score_extraction_quality(annotated, document.raw_metadata)
     return {
         "schema_version": SOURCE_PAYLOAD_SCHEMA_VERSION,
         "policy_version": SOURCE_PAYLOAD_POLICY_VERSION,
@@ -144,6 +147,8 @@ def document_source_payload(document: InputDocument, *, max_chars: int | None) -
         "source_path": document.source_path,
         "source_metadata": document.raw_metadata,
         "spans": [span.model_dump(mode="json") for span in spans],
+        "section_index": section_index,
+        "extraction_quality": extraction_quality,
         "source_integrity": {
             "schema": "claims_source_payload_integrity_v1",
             "truncated": truncated,
@@ -151,9 +156,110 @@ def document_source_payload(document: InputDocument, *, max_chars: int | None) -
             "character_count": sum(len(span.text) for span in spans),
             "page_count": len({span.page for span in spans if span.page is not None}),
             "content_sha256": hashlib.sha256(source_text.encode("utf-8")).hexdigest(),
-            "complete_span_count": len(document.spans),
-            "complete_character_count": sum(len(span.text) for span in document.spans),
+            "complete_span_count": len(annotated),
+            "complete_character_count": sum(len(span.text) for span in annotated),
         },
+    }
+
+
+_SECTION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("ABSTRACT", re.compile(r"^\s{0,3}(?:#+\s*)?(?:\d+(?:\.\d+)*\s+)?abstract\b", re.I | re.M)),
+    ("INTRODUCTION", re.compile(r"^\s{0,3}(?:#+\s*)?(?:\d+(?:\.\d+)*\s+)?introduction\b", re.I | re.M)),
+    ("METHODS", re.compile(r"^\s{0,3}(?:#+\s*)?(?:\d+(?:\.\d+)*\s+)?(?:methods?|materials?\s+and\s+methods|methodology)\b", re.I | re.M)),
+    ("RESULTS", re.compile(r"^\s{0,3}(?:#+\s*)?(?:\d+(?:\.\d+)*\s+)?results?\b", re.I | re.M)),
+    ("DISCUSSION", re.compile(r"^\s{0,3}(?:#+\s*)?(?:\d+(?:\.\d+)*\s+)?discussion\b", re.I | re.M)),
+    ("LIMITATIONS", re.compile(r"^\s{0,3}(?:#+\s*)?(?:\d+(?:\.\d+)*\s+)?limitations?\b", re.I | re.M)),
+    ("CONCLUSION", re.compile(r"^\s{0,3}(?:#+\s*)?(?:\d+(?:\.\d+)*\s+)?conclusions?\b", re.I | re.M)),
+    ("APPENDIX", re.compile(r"^\s{0,3}(?:#+\s*)?(?:\d+(?:\.\d+)*\s+)?appendix\b", re.I | re.M)),
+    ("TABLE", re.compile(r"^\s{0,3}(?:#+\s*)?table\s+\d+", re.I | re.M)),
+    ("FIGURE", re.compile(r"^\s{0,3}(?:#+\s*)?figure\s+\d+", re.I | re.M)),
+)
+
+
+def _annotate_section(span: InputSpan) -> InputSpan:
+    """Infer coarse section labels for page-level readers that lack TEI structure."""
+    if span.section_type and span.section_type not in {"OTHER", "PAGE"}:
+        return span
+    inferred = _infer_section_type(span.text)
+    if not inferred:
+        return span
+    section_name = span.section_name or inferred.title()
+    metadata = dict(span.metadata)
+    metadata["inferred_section_type"] = inferred
+    return span.model_copy(update={"section_type": inferred, "section_name": section_name, "metadata": metadata})
+
+
+def _infer_section_type(text: str) -> str:
+    head = "\n".join((text or "").splitlines()[:12])
+    for section_type, pattern in _SECTION_PATTERNS:
+        if pattern.search(head):
+            return section_type
+    return ""
+
+
+def build_section_index(spans: list[InputSpan]) -> dict[str, Any]:
+    by_type: dict[str, list[str]] = {}
+    tables: list[str] = []
+    figures: list[str] = []
+    for span in spans:
+        section_type = (span.section_type or "OTHER").upper()
+        by_type.setdefault(section_type, []).append(span.span_id)
+        lowered = span.text[:240].casefold()
+        if section_type == "TABLE" or lowered.startswith("table "):
+            tables.append(span.span_id)
+        if section_type == "FIGURE" or lowered.startswith("figure "):
+            figures.append(span.span_id)
+    return {
+        "schema": "claims_section_index_v1",
+        "by_section_type": by_type,
+        "table_span_ids": tables,
+        "figure_caption_span_ids": figures,
+        "section_types_present": sorted(by_type),
+    }
+
+
+def score_extraction_quality(spans: list[InputSpan], raw_metadata: dict[str, Any]) -> dict[str, Any]:
+    character_count = sum(len(span.text) for span in spans)
+    section_types = {(span.section_type or "OTHER").upper() for span in spans}
+    useful_sections = section_types & {
+        "ABSTRACT",
+        "INTRODUCTION",
+        "METHODS",
+        "RESULTS",
+        "DISCUSSION",
+        "LIMITATIONS",
+        "CONCLUSION",
+        "TABLE",
+        "FIGURE",
+    }
+    pages_needing_ocr = list(raw_metadata.get("pages_needing_ocr") or [])
+    empty = character_count == 0 or not spans
+    score = 0.0
+    if not empty:
+        score += 0.35
+    if character_count >= 2000:
+        score += 0.2
+    if len(useful_sections) >= 3:
+        score += 0.25
+    elif len(useful_sections) >= 1:
+        score += 0.1
+    if raw_metadata.get("pdf_reader") == "grobid":
+        score += 0.1
+    if pages_needing_ocr:
+        score -= min(0.25, 0.05 * len(pages_needing_ocr))
+    if bool(raw_metadata.get("is_complex")):
+        score -= 0.05
+    score = max(0.0, min(1.0, round(score, 3)))
+    return {
+        "schema": "claims_extraction_quality_v1",
+        "score": score,
+        "empty": empty,
+        "character_count": character_count,
+        "span_count": len(spans),
+        "useful_section_count": len(useful_sections),
+        "useful_sections": sorted(useful_sections),
+        "pages_needing_ocr": pages_needing_ocr,
+        "recommend_reader_fallback": empty or score < 0.35 or bool(pages_needing_ocr),
     }
 
 

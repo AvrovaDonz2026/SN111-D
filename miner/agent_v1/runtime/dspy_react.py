@@ -116,9 +116,12 @@ def _runtime_instructions(skill_pack: SkillPack) -> str:
     return "\n\n".join(
         [
             skill_pack.render_for_agent(),
+            "Follow references/sn111-two-stage-protocol.md: Stage A source map, Stage B candidate claims, Stage C deterministic audit, then JSON.",
+            "Use read_section_index, search_source_text, and read_source_span before writing claims. Prefer local quote repairs over full rewrites.",
             "Use the provided tools when you need source text, skill resources, validation, or file output.",
             "Read agent_schema.json or use read_output_schema before producing the final structured payload.",
             "Every claim proof ID must exist in logic.experiments, and every evidence_id must exist in evidence.records.",
+            "Every evidence/claim source quote must be a contiguous verbatim substring of the cited source span.",
             "Read coverage_requirements_json carefully. The artifact is invalid if logic.claims has fewer than minimum_claim_count distinct source-grounded claims.",
             "For normal research papers, extract a coverage-oriented set of 3-7 central claims when source-supported. Do not stop at one or two broad claims if paper.claims_summary or source spans contain multiple distinct findings.",
             "Split evidence records by distinct support basis; do not point every claim at the same generic evidence record.",

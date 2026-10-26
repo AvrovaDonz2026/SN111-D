@@ -69,16 +69,25 @@ class DspyReActRuntime:
                 ),
             )
 
+        output_path = run_dir / request.expected_output_path
+        # Drop stale drafts from prior repair attempts so a later final_json or
+        # submit_agent_artifact can replace a previously blocked artifact.
+        if output_path.exists():
+            output_path.unlink()
         if hasattr(dspy_module, "context"):
             with dspy_module.context(lm=lm):
                 prediction = run_program()
         else:
             dspy_module.configure(lm=lm)
             prediction = run_program()
-        raw_output = str(getattr(prediction, "final_json", ""))
-        output_path = run_dir / request.expected_output_path
-        if not output_path.exists():
+        raw_output = str(getattr(prediction, "final_json", "") or "").strip()
+        if output_path.exists():
+            # submit_agent_artifact already wrote an accepted payload during the loop.
+            pass
+        elif raw_output:
             output_path.write_text(raw_output, encoding="utf-8")
+        else:
+            output_path.write_text("{}", encoding="utf-8")
         return AgentResult(
             output_path=output_path,
             manifest={

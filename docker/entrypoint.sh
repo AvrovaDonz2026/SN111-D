@@ -213,7 +213,7 @@ case "${mode}" in
       --claims.agent-harness "${miner_harness:-hermes-cli}" \
       --claims.agent-model "${miner_model:-deepseek/deepseek-v4-flash}" \
       --claims.pdf-extraction-method "${SUBNET_CLAIMS_PDF_READER:-pdf-inspector}" \
-      --claims.batch-max-workers "${CLAIMS_MINER_BATCH_MAX_WORKERS:-2}" \
+      --claims.batch-max-workers "${CLAIMS_MINER_BATCH_MAX_WORKERS:-4}" \
       --claims.output-dir "${CLAIMS_MINER_OUTPUT_DIR:-${data_root}/outputs/miner}" \
       "$@"
     ;;

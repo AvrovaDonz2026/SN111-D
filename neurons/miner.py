@@ -195,8 +195,11 @@ class ClaimsMiner:
             "--claims.batch-max-workers",
             dest="claims_batch_max_workers",
             type=int,
-            default=int(os.getenv("CLAIMS_MINER_BATCH_MAX_WORKERS", "1")),
-            help="Maximum number of papers this miner processes concurrently inside one batch request.",
+            default=int(os.getenv("CLAIMS_MINER_BATCH_MAX_WORKERS", "4")),
+            help=(
+                "Maximum number of papers this miner processes concurrently inside one batch request. "
+                "Default 4 so a 50-paper / 1-hour batch can finish; pair with SUBNET_CLAIMS_AGENT_MAX_CONCURRENT."
+            ),
         )
         parser.add_argument(
             "--claims.batch-include-source-payload",

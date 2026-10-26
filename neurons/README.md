@@ -55,7 +55,7 @@ python -m neurons.miner \
   --axon.external_port 8091 \
   --claims.pipeline agent_v1 \
   --claims.agent-runtime dspy-react \
-  --claims.batch-max-workers 2 \
+  --claims.batch-max-workers 4 \
   --claims.output-dir miner/agent_v1/outputs/neuron/testnet
 ```
 
@@ -78,7 +78,7 @@ python -m neurons.miner \
   --claims.pipeline agent_v1 \
   --claims.agent-runtime agent-cli \
   --claims.agent-cli-command ".venv/bin/python -m miner.agent_v1.wrappers.hermes_prompt" \
-  --claims.batch-max-workers 2 \
+  --claims.batch-max-workers 4 \
   --claims.output-dir miner/agent_v1/outputs/neuron/testnet
 ```
 

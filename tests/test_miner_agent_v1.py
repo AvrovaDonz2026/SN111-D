@@ -6,6 +6,7 @@ import shlex
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -977,9 +978,19 @@ def test_miner_batch_task_returns_one_article_per_paper(monkeypatch, tmp_path: P
     miner._read_cached_extraction = lambda _cache_key: None
     miner._read_cached_source_payload = lambda _cache_key: None
     calls: list[str] = []
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
 
     def fake_run_task(paper_task, *, cache_key, validator_hotkey):
-        calls.append(paper_task.paper_id)
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+            calls.append(paper_task.paper_id)
+        time.sleep(0.08)
+        with lock:
+            active -= 1
         return (
             {"paper": {"paper_id": paper_task.paper_id}, "logic": {"claims": []}, "metadata": {"cache_key": cache_key, "submission_eligible": True}},
             {"paper": {"paper_id": paper_task.paper_id}, "spans": []},
@@ -997,7 +1008,9 @@ def test_miner_batch_task_returns_one_article_per_paper(monkeypatch, tmp_path: P
         }
     )
 
+    started = time.perf_counter()
     articles = miner._run_batch_task(task, validator_hotkey="validator")
+    elapsed = time.perf_counter() - started
 
     assert [article["paper_id"] for article in articles] == ["paper_a", "paper_b"]
     assert [article["status"] for article in articles] == ["completed", "completed"]
@@ -1005,6 +1018,34 @@ def test_miner_batch_task_returns_one_article_per_paper(monkeypatch, tmp_path: P
     assert all("extraction" not in article for article in articles)
     assert all("source_payload" not in article for article in articles)
     assert sorted(calls) == ["paper_a", "paper_b"]
+    assert max_active >= 2
+    assert elapsed < 0.14  # serial would be ~0.16s+; parallel should finish near one sleep
+
+
+def test_agent_max_concurrent_slots_bound_parallel_runs(monkeypatch) -> None:
+    from miner.agent_v1.concurrency import acquire_agent_slot, reset_agent_slots_for_tests
+
+    monkeypatch.setenv("SUBNET_CLAIMS_AGENT_MAX_CONCURRENT", "1")
+    reset_agent_slots_for_tests()
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+
+    def worker() -> None:
+        nonlocal active, max_active
+        with acquire_agent_slot():
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            time.sleep(0.05)
+            with lock:
+                active -= 1
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        list(executor.map(lambda _i: worker(), range(3)))
+
+    assert max_active == 1
+    reset_agent_slots_for_tests()
 
 
 def test_miner_coalesces_duplicate_in_flight_paper_work() -> None:

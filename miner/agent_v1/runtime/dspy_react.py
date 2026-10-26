@@ -7,6 +7,7 @@ from typing import Any
 
 from .base import AgentRequest, AgentResult
 from .usage import usage_from_dspy_lm
+from ..concurrency import acquire_agent_slot, agent_max_concurrent, dspy_configure_lock
 from ..config import AgentV1Config
 from ..provider import dspy_model_id
 from ..skillpack import SkillPack
@@ -78,12 +79,16 @@ class DspyReActRuntime:
         # submit_agent_artifact can replace a previously blocked artifact.
         if output_path.exists():
             output_path.unlink()
-        if hasattr(dspy_module, "context"):
-            with dspy_module.context(lm=lm):
-                prediction = run_program()
-        else:
-            dspy_module.configure(lm=lm)
-            prediction = run_program()
+        # Batch papers share a process-wide slot pool so cha86/OpenRouter are not
+        # flooded when CLAIMS_MINER_BATCH_MAX_WORKERS > 1.
+        with acquire_agent_slot():
+            if hasattr(dspy_module, "context"):
+                with dspy_module.context(lm=lm):
+                    prediction = run_program()
+            else:
+                with dspy_configure_lock():
+                    dspy_module.configure(lm=lm)
+                    prediction = run_program()
         raw_output = str(getattr(prediction, "final_json", "") or "").strip()
         if output_path.exists():
             # submit_agent_artifact already wrote an accepted payload during the loop.
@@ -100,6 +105,7 @@ class DspyReActRuntime:
                 "elapsed_seconds": round(time.time() - started, 3),
                 "usage": usage_from_dspy_lm(lm),
                 "skill": skill_pack.manifest(),
+                "agent_max_concurrent": agent_max_concurrent(),
             },
         )
 

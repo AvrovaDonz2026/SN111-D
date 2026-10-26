@@ -40,6 +40,8 @@ class DspyReActRuntime:
             api_base=self.config.api_base,
             temperature=self.config.temperature,
             max_tokens=self.config.max_tokens,
+            # Repair loops must not reuse a cached empty/invalid final_json.
+            cache=False,
         )
 
         class CompileSignature(dspy_module.Signature):

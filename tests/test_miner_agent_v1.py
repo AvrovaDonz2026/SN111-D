@@ -1022,6 +1022,50 @@ def test_miner_batch_task_returns_one_article_per_paper(monkeypatch, tmp_path: P
     assert elapsed < 0.14  # serial would be ~0.16s+; parallel should finish near one sleep
 
 
+def test_is_overload_error_detects_cha86_messages() -> None:
+    from miner.agent_v1.provider_retry import is_overload_error
+    from miner.agent_v1.streaming import StreamStallError
+
+    assert is_overload_error(RuntimeError("Our servers are currently overloaded. Please try again later."))
+    assert is_overload_error(StreamStallError("LLM stream stalled for 46.0s"))
+    assert is_overload_error(type("MidStreamFallbackError", (Exception,), {})("mid stream boom"))
+    assert not is_overload_error(ValueError("invalid json schema"))
+
+
+def test_call_with_overload_retry_recovers_after_transient_failure() -> None:
+    from miner.agent_v1.provider_retry import call_with_overload_retry
+
+    sleeps: list[float] = []
+    state = {"n": 0}
+
+    def flaky() -> str:
+        state["n"] += 1
+        if state["n"] < 3:
+            raise RuntimeError("Our servers are currently overloaded. Please try again later.")
+        return "ok"
+
+    assert call_with_overload_retry(flaky, retries=3, backoff_seconds=1.0, sleep=sleeps.append) == "ok"
+    assert state["n"] == 3
+    assert len(sleeps) == 2
+    assert sleeps[0] >= 1.0
+
+
+def test_call_with_overload_retry_does_not_retry_permanent_errors() -> None:
+    from miner.agent_v1.provider_retry import call_with_overload_retry
+
+    sleeps: list[float] = []
+
+    def boom() -> str:
+        raise ValueError("bad artifact")
+
+    try:
+        call_with_overload_retry(boom, retries=3, backoff_seconds=1.0, sleep=sleeps.append)
+        assert False, "expected ValueError"
+    except ValueError:
+        pass
+    assert sleeps == []
+
+
 def test_force_stream_assemble_rebuilds_completion(monkeypatch) -> None:
     import dspy.clients.lm as lm_mod
     from miner.agent_v1.streaming import force_stream_assemble

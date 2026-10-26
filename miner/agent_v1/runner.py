@@ -17,6 +17,7 @@ from .schema import AGENT_JSON_SCHEMA_FILENAME, agent_json_schema, write_agent_j
 from .skillpack import load_skill_pack
 from .local_repair import artifact_repair_rank, repair_artifact_grounding
 from .preflight import run_preflight
+from .provider_retry import call_with_overload_retry
 
 
 logger = logging.getLogger(__name__)
@@ -204,7 +205,17 @@ class AgentV1Runner:
                 json.dumps(request.model_dump(mode="json"), indent=2, ensure_ascii=False),
                 encoding="utf-8",
             )
-            result = runtime.run_skill(skill_pack=skill_pack, run_dir=run_dir, request=request)
+            result = call_with_overload_retry(
+                lambda: runtime.run_skill(skill_pack=skill_pack, run_dir=run_dir, request=request),
+                retries=self.config.overload_retries,
+                backoff_seconds=self.config.overload_backoff_seconds,
+                backoff_max_seconds=self.config.overload_backoff_max_seconds,
+                label=f"agent_v1.run_skill paper={getattr(document.paper, 'paper_id', '')}",
+            )
+            result.manifest = {
+                **(result.manifest or {}),
+                "overload_retries_configured": self.config.overload_retries,
+            }
             manifests.append(result.manifest)
             self._write_runtime_files(run_dir, result.manifest, result.stdout, result.stderr)
             raw = _read_json_object(result.output_path)

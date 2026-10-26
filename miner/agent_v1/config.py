@@ -37,6 +37,10 @@ class AgentV1Config(BaseModel):
     # Stream under the hood so silent provider hangs fail on inter-chunk timeout.
     stream_completions: bool = True
     stream_stall_seconds: float = Field(default=45.0, ge=5.0)
+    # Extra attempts when the provider returns overload / mid-stream / transport errors.
+    overload_retries: int = Field(default=3, ge=0)
+    overload_backoff_seconds: float = Field(default=5.0, ge=0.0)
+    overload_backoff_max_seconds: float = Field(default=60.0, ge=1.0)
     cli_command: list[str] = []
 
     @classmethod
@@ -91,8 +95,11 @@ class AgentV1Config(BaseModel):
             or "sn111d-preflight-v1",
             stream_completions=_env_flag("SUBNET_CLAIMS_AGENT_STREAM", default=True),
             stream_stall_seconds=float(os.getenv("SUBNET_CLAIMS_AGENT_STREAM_STALL_SECONDS", "45")),
+            overload_retries=int(os.getenv("SUBNET_CLAIMS_AGENT_OVERLOAD_RETRIES", "3")),
+            overload_backoff_seconds=float(os.getenv("SUBNET_CLAIMS_AGENT_OVERLOAD_BACKOFF_SECONDS", "5")),
+            overload_backoff_max_seconds=float(os.getenv("SUBNET_CLAIMS_AGENT_OVERLOAD_BACKOFF_MAX_SECONDS", "60")),
             cli_command=shlex.split(os.getenv("SUBNET_CLAIMS_AGENT_CLI_COMMAND", "")),
-        )
+        }
 
     def require_api_key(self) -> str:
         if not self.api_key:
@@ -123,6 +130,9 @@ class AgentV1Config(BaseModel):
             "experiment_version": self.experiment_version,
             "stream_completions": self.stream_completions,
             "stream_stall_seconds": self.stream_stall_seconds,
+            "overload_retries": self.overload_retries,
+            "overload_backoff_seconds": self.overload_backoff_seconds,
+            "overload_backoff_max_seconds": self.overload_backoff_max_seconds,
             "cli_command_configured": bool(self.cli_command),
         }
 

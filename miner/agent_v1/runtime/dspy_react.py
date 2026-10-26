@@ -111,7 +111,11 @@ def _to_dspy_tool(dspy_module: Any, spec):
 def _coverage_requirements(request: AgentRequest) -> dict[str, Any]:
     paper = request.paper if isinstance(request.paper, dict) else {}
     claims_summary = [item for item in paper.get("claims_summary", []) if isinstance(item, str) and item.strip()]
-    minimum_claim_count = min(3, len(claims_summary)) if len(claims_summary) >= 3 else len(claims_summary)
+    if claims_summary:
+        minimum_claim_count = min(3, len(claims_summary)) if len(claims_summary) >= 3 else len(claims_summary)
+    else:
+        # PDF/text ingest often lacks claims_summary; still require a grounded claim set.
+        minimum_claim_count = 3
     return {
         "minimum_claim_count": minimum_claim_count,
         "target_claim_count": "3-7 central claims for normal research papers when source-supported",
@@ -122,19 +126,34 @@ def _coverage_requirements(request: AgentRequest) -> dict[str, Any]:
 
 
 def _runtime_instructions(skill_pack: SkillPack) -> str:
+    """Compact SN111 instructions.
+
+    Embedding the full ARA skill pack (~95KB) into every ReAct turn crowds out
+    paper evidence and causes empty/invalid artifacts on real PDFs. Keep a short
+    protocol here and load long references via ``read_skill_resource`` on demand.
+    """
+    protocol = ""
+    try:
+        protocol = skill_pack.resource_text("references/sn111-two-stage-protocol.md").strip()
+    except FileNotFoundError:
+        protocol = "Stage A source map → Stage B candidate claims → Stage C deterministic audit → JSON."
+    skill_name = skill_pack.name
     return "\n\n".join(
         [
-            skill_pack.render_for_agent(),
-            "Follow references/sn111-two-stage-protocol.md: Stage A source map, Stage B candidate claims, Stage C deterministic audit, then JSON.",
-            "Use read_section_index, search_source_text, and read_source_span before writing claims. Prefer local quote repairs over full rewrites.",
-            "Use the provided tools when you need source text, skill resources, validation, or file output.",
-            "Read agent_schema.json or use read_output_schema before producing the final structured payload.",
-            "Every claim proof ID must exist in logic.experiments, and every evidence_id must exist in evidence.records.",
+            f"# Skill: {skill_name}",
+            "You are the Claims agent_v1 miner. Produce one strict agent_output.json artifact.",
+            protocol,
+            "Do not invent quotes. Prefer 3-7 central claims with verbatim source quotes.",
+            "Empty logic.claims is always invalid. Never return a skeleton without claims/evidence/experiments.",
+            "Tools: read_section_index, search_source_text, read_source_span, read_source_payload,",
+            "read_output_schema, read_skill_resource, validate_agent_artifact, submit_agent_artifact.",
+            "Load longer ARA guidance only if needed via read_skill_resource(",
+            "'references/validation-checklist.md' or 'references/claims-agent-v1-json-output-contract.md').",
+            "Every claim proof ID must exist in logic.experiments; every evidence_id must exist in evidence.records.",
             "Every evidence/claim source quote must be a contiguous verbatim substring of the cited source span.",
-            "Read coverage_requirements_json carefully. The artifact is invalid if logic.claims has fewer than minimum_claim_count distinct source-grounded claims.",
-            "For normal research papers, extract a coverage-oriented set of 3-7 central claims when source-supported. Do not stop at one or two broad claims if paper.claims_summary or source spans contain multiple distinct findings.",
-            "Split evidence records by distinct support basis; do not point every claim at the same generic evidence record.",
-            "If validation_feedback_json contains issues, explicitly fix every issue in the returned JSON.",
+            "Read coverage_requirements_json carefully and satisfy minimum_claim_count.",
+            "Split evidence records by distinct support basis.",
+            "If validation_feedback_json contains issues, fix every issue with a local repair.",
             "Call submit_agent_artifact with the final JSON when ready, and also return the same strict JSON in final_json.",
         ]
     )

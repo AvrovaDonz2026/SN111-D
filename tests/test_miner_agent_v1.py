@@ -1022,6 +1022,51 @@ def test_miner_batch_task_returns_one_article_per_paper(monkeypatch, tmp_path: P
     assert elapsed < 0.14  # serial would be ~0.16s+; parallel should finish near one sleep
 
 
+def test_force_stream_assemble_rebuilds_completion(monkeypatch) -> None:
+    import dspy.clients.lm as lm_mod
+    from miner.agent_v1.streaming import force_stream_assemble
+
+    class _Chunk:
+        def __init__(self, content: str) -> None:
+            self.choices = [SimpleNamespace(delta=SimpleNamespace(content=content, tool_calls=None), finish_reason=None)]
+
+    class _Final(_Chunk):
+        def __init__(self) -> None:
+            super().__init__("")
+            self.choices = [SimpleNamespace(delta=SimpleNamespace(content="", tool_calls=None), finish_reason="stop")]
+
+    built = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="hello"))])
+
+    def fake_completion(**kwargs):
+        assert kwargs.get("stream") is True
+        assert kwargs.get("stream_options", {}).get("include_usage") is True
+        return iter([_Chunk("hel"), _Chunk("lo"), _Final()])
+
+    monkeypatch.setattr("litellm.completion", fake_completion)
+    monkeypatch.setattr("litellm.stream_chunk_builder", lambda chunks: built)
+    monkeypatch.setattr(lm_mod, "_get_stream_completion_fn", lambda *args, **kwargs: None)
+
+    with force_stream_assemble(stall_seconds=5):
+        result = lm_mod.litellm_completion({"model": "x", "messages": []}, num_retries=0, cache=None)
+
+    assert result is built
+
+
+def test_force_stream_assemble_raises_on_empty_stream(monkeypatch) -> None:
+    import dspy.clients.lm as lm_mod
+    from miner.agent_v1.streaming import StreamStallError, force_stream_assemble
+
+    monkeypatch.setattr("litellm.completion", lambda **_kwargs: iter([]))
+    monkeypatch.setattr(lm_mod, "_get_stream_completion_fn", lambda *args, **kwargs: None)
+
+    with force_stream_assemble(stall_seconds=5):
+        try:
+            lm_mod.litellm_completion({"model": "x", "messages": []}, num_retries=0, cache=None)
+            assert False, "expected StreamStallError"
+        except StreamStallError as exc:
+            assert "no chunks" in str(exc)
+
+
 def test_agent_max_concurrent_slots_bound_parallel_runs(monkeypatch) -> None:
     from miner.agent_v1.concurrency import acquire_agent_slot, reset_agent_slots_for_tests
 

@@ -11,6 +11,7 @@ from ..concurrency import acquire_agent_slot, agent_max_concurrent, dspy_configu
 from ..config import AgentV1Config
 from ..provider import dspy_model_id
 from ..skillpack import SkillPack
+from ..streaming import force_stream_assemble
 from ..tools import AgentToolbox
 
 
@@ -81,14 +82,20 @@ class DspyReActRuntime:
             output_path.unlink()
         # Batch papers share a process-wide slot pool so cha86/OpenRouter are not
         # flooded when CLAIMS_MINER_BATCH_MAX_WORKERS > 1.
-        with acquire_agent_slot():
+        def _invoke() -> Any:
             if hasattr(dspy_module, "context"):
                 with dspy_module.context(lm=lm):
-                    prediction = run_program()
+                    return run_program()
+            with dspy_configure_lock():
+                dspy_module.configure(lm=lm)
+                return run_program()
+
+        with acquire_agent_slot():
+            if self.config.stream_completions:
+                with force_stream_assemble(stall_seconds=self.config.stream_stall_seconds):
+                    prediction = _invoke()
             else:
-                with dspy_configure_lock():
-                    dspy_module.configure(lm=lm)
-                    prediction = run_program()
+                prediction = _invoke()
         raw_output = str(getattr(prediction, "final_json", "") or "").strip()
         if output_path.exists():
             # submit_agent_artifact already wrote an accepted payload during the loop.
@@ -106,6 +113,8 @@ class DspyReActRuntime:
                 "usage": usage_from_dspy_lm(lm),
                 "skill": skill_pack.manifest(),
                 "agent_max_concurrent": agent_max_concurrent(),
+                "stream_completions": self.config.stream_completions,
+                "stream_stall_seconds": self.config.stream_stall_seconds,
             },
         )
 

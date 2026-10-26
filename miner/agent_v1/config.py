@@ -34,6 +34,9 @@ class AgentV1Config(BaseModel):
     max_repair_attempts: int = Field(default=3, ge=1)
     require_source_grounding: bool = True
     experiment_version: str = "sn111d-preflight-v1"
+    # Stream under the hood so silent provider hangs fail on inter-chunk timeout.
+    stream_completions: bool = True
+    stream_stall_seconds: float = Field(default=45.0, ge=5.0)
     cli_command: list[str] = []
 
     @classmethod
@@ -86,6 +89,8 @@ class AgentV1Config(BaseModel):
             require_source_grounding=_env_flag("SUBNET_CLAIMS_REQUIRE_SOURCE_GROUNDING", default=True),
             experiment_version=os.getenv("SUBNET_CLAIMS_EXPERIMENT_VERSION", "sn111d-preflight-v1").strip()
             or "sn111d-preflight-v1",
+            stream_completions=_env_flag("SUBNET_CLAIMS_AGENT_STREAM", default=True),
+            stream_stall_seconds=float(os.getenv("SUBNET_CLAIMS_AGENT_STREAM_STALL_SECONDS", "45")),
             cli_command=shlex.split(os.getenv("SUBNET_CLAIMS_AGENT_CLI_COMMAND", "")),
         )
 
@@ -116,6 +121,8 @@ class AgentV1Config(BaseModel):
             "max_repair_attempts": self.max_repair_attempts,
             "require_source_grounding": self.require_source_grounding,
             "experiment_version": self.experiment_version,
+            "stream_completions": self.stream_completions,
+            "stream_stall_seconds": self.stream_stall_seconds,
             "cli_command_configured": bool(self.cli_command),
         }
 

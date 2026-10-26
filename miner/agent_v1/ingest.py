@@ -132,7 +132,7 @@ def ingest_text(text_path: Path, *, max_chars: int | None) -> InputDocument:
 
 
 def document_source_payload(document: InputDocument, *, max_chars: int | None) -> dict[str, Any]:
-    annotated = [_annotate_section(span) for span in document.spans]
+    annotated = _annotate_sections_with_carry(document.spans)
     spans = _truncate_spans(annotated, max_chars=max_chars)
     source_text = "\n\n".join(span.text for span in spans)
     complete_text = "\n\n".join(span.text for span in annotated)
@@ -163,64 +163,141 @@ def document_source_payload(document: InputDocument, *, max_chars: int | None) -
 
 
 _SECTION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("ABSTRACT", re.compile(r"^\s{0,3}(?:#+\s*)?(?:\d+(?:\.\d+)*\s+)?abstract\b", re.I | re.M)),
-    ("INTRODUCTION", re.compile(r"^\s{0,3}(?:#+\s*)?(?:\d+(?:\.\d+)*\s+)?introduction\b", re.I | re.M)),
-    ("METHODS", re.compile(r"^\s{0,3}(?:#+\s*)?(?:\d+(?:\.\d+)*\s+)?(?:methods?|materials?\s+and\s+methods|methodology)\b", re.I | re.M)),
-    ("RESULTS", re.compile(r"^\s{0,3}(?:#+\s*)?(?:\d+(?:\.\d+)*\s+)?results?\b", re.I | re.M)),
-    ("DISCUSSION", re.compile(r"^\s{0,3}(?:#+\s*)?(?:\d+(?:\.\d+)*\s+)?discussion\b", re.I | re.M)),
-    ("LIMITATIONS", re.compile(r"^\s{0,3}(?:#+\s*)?(?:\d+(?:\.\d+)*\s+)?limitations?\b", re.I | re.M)),
-    ("CONCLUSION", re.compile(r"^\s{0,3}(?:#+\s*)?(?:\d+(?:\.\d+)*\s+)?conclusions?\b", re.I | re.M)),
-    ("APPENDIX", re.compile(r"^\s{0,3}(?:#+\s*)?(?:\d+(?:\.\d+)*\s+)?appendix\b", re.I | re.M)),
-    ("TABLE", re.compile(r"^\s{0,3}(?:#+\s*)?table\s+\d+", re.I | re.M)),
-    ("FIGURE", re.compile(r"^\s{0,3}(?:#+\s*)?figure\s+\d+", re.I | re.M)),
+    ("ABSTRACT", re.compile(r"(?m)^\s{0,3}(?:#+\s*)?(?:\d+(?:\.\d+)*[\.\)]?\s+)?abstract\b", re.I)),
+    ("INTRODUCTION", re.compile(r"(?m)^\s{0,3}(?:#+\s*)?(?:\d+(?:\.\d+)*[\.\)]?\s+)?introduction\b", re.I)),
+    ("METHODS", re.compile(r"(?m)^\s{0,3}(?:#+\s*)?(?:\d+(?:\.\d+)*[\.\)]?\s+)?(?:methods?|materials?\s+and\s+methods|methodology|experimental\s+setup)\b", re.I)),
+    ("RESULTS", re.compile(r"(?m)^\s{0,3}(?:#+\s*)?(?:\d+(?:\.\d+)*[\.\)]?\s+)?(?:results?|findings?|empirical\s+results?)\b", re.I)),
+    ("DISCUSSION", re.compile(r"(?m)^\s{0,3}(?:#+\s*)?(?:\d+(?:\.\d+)*[\.\)]?\s+)?discussion\b", re.I)),
+    ("LIMITATIONS", re.compile(r"(?m)^\s{0,3}(?:#+\s*)?(?:\d+(?:\.\d+)*[\.\)]?\s+)?limitations?\b", re.I)),
+    ("CONCLUSION", re.compile(r"(?m)^\s{0,3}(?:#+\s*)?(?:\d+(?:\.\d+)*[\.\)]?\s+)?conclusions?\b", re.I)),
+    ("APPENDIX", re.compile(r"(?m)^\s{0,3}(?:#+\s*)?(?:\d+(?:\.\d+)*[\.\)]?\s+)?(?:appendix|supplementary)\b", re.I)),
+    ("TABLE", re.compile(r"(?m)^\s{0,3}(?:#+\s*)?table\s+\d+", re.I)),
+    ("FIGURE", re.compile(r"(?m)^\s{0,3}(?:#+\s*)?figure\s+\d+", re.I)),
 )
+
+_INLINE_SECTION_RE = re.compile(
+    r"(?i)\b(abstract|introduction|methods?|materials and methods|methodology|results?|findings?|discussion|limitations?|conclusions?|appendix)\b"
+)
+
+
+def _annotate_sections_with_carry(spans: list[InputSpan]) -> list[InputSpan]:
+    """Infer section labels and carry the last known section across page spans."""
+    annotated: list[InputSpan] = []
+    current = ""
+    for span in spans:
+        if span.section_type and span.section_type not in {"OTHER", "PAGE"}:
+            current = span.section_type.upper()
+            annotated.append(span)
+            continue
+        inferred = _infer_section_type(span.text) or current
+        if inferred and inferred != (span.section_type or ""):
+            metadata = dict(span.metadata)
+            metadata["inferred_section_type"] = inferred
+            if current and inferred == current:
+                metadata["section_carried_forward"] = True
+            annotated.append(
+                span.model_copy(
+                    update={
+                        "section_type": inferred,
+                        "section_name": span.section_name or inferred.title(),
+                        "metadata": metadata,
+                    }
+                )
+            )
+            current = inferred
+        else:
+            annotated.append(span)
+    return annotated
 
 
 def _annotate_section(span: InputSpan) -> InputSpan:
     """Infer coarse section labels for page-level readers that lack TEI structure."""
-    if span.section_type and span.section_type not in {"OTHER", "PAGE"}:
-        return span
-    inferred = _infer_section_type(span.text)
-    if not inferred:
-        return span
-    section_name = span.section_name or inferred.title()
-    metadata = dict(span.metadata)
-    metadata["inferred_section_type"] = inferred
-    return span.model_copy(update={"section_type": inferred, "section_name": section_name, "metadata": metadata})
+    return _annotate_sections_with_carry([span])[0]
 
 
 def _infer_section_type(text: str) -> str:
-    head = "\n".join((text or "").splitlines()[:12])
+    # Prefer early heading lines, then fall back to any markdown/numbered heading in-page.
+    lines = (text or "").splitlines()
+    head = "\n".join(lines[:20])
     for section_type, pattern in _SECTION_PATTERNS:
         if pattern.search(head):
             return section_type
+    body = "\n".join(lines)
+    best_type = ""
+    best_pos = 10**9
+    for section_type, pattern in _SECTION_PATTERNS:
+        match = pattern.search(body)
+        if match and match.start() < best_pos:
+            best_pos = match.start()
+            best_type = section_type
+    if best_type:
+        return best_type
+    # Last resort: inline word near the top of the page.
+    for match in _INLINE_SECTION_RE.finditer("\n".join(lines[:40])):
+        token = match.group(1).casefold()
+        mapping = {
+            "abstract": "ABSTRACT",
+            "introduction": "INTRODUCTION",
+            "method": "METHODS",
+            "methods": "METHODS",
+            "materials and methods": "METHODS",
+            "methodology": "METHODS",
+            "result": "RESULTS",
+            "results": "RESULTS",
+            "findings": "RESULTS",
+            "discussion": "DISCUSSION",
+            "limitation": "LIMITATIONS",
+            "limitations": "LIMITATIONS",
+            "conclusion": "CONCLUSION",
+            "conclusions": "CONCLUSION",
+            "appendix": "APPENDIX",
+        }
+        return mapping.get(token, "")
     return ""
 
 
 def build_section_index(spans: list[InputSpan]) -> dict[str, Any]:
     by_type: dict[str, list[str]] = {}
+    detected_in_text: dict[str, list[str]] = {}
     tables: list[str] = []
     figures: list[str] = []
     for span in spans:
         section_type = (span.section_type or "OTHER").upper()
         by_type.setdefault(section_type, []).append(span.span_id)
+        for detected in _detect_section_types_in_text(span.text):
+            detected_in_text.setdefault(detected, []).append(span.span_id)
         lowered = span.text[:240].casefold()
-        if section_type == "TABLE" or lowered.startswith("table "):
-            tables.append(span.span_id)
-        if section_type == "FIGURE" or lowered.startswith("figure "):
-            figures.append(span.span_id)
+        if section_type == "TABLE" or span.span_id in detected_in_text.get("TABLE", []) or lowered.startswith("table "):
+            if span.span_id not in tables:
+                tables.append(span.span_id)
+        if section_type == "FIGURE" or span.span_id in detected_in_text.get("FIGURE", []) or lowered.startswith("figure "):
+            if span.span_id not in figures:
+                figures.append(span.span_id)
+    present = sorted(set(by_type) | set(detected_in_text))
     return {
         "schema": "claims_section_index_v1",
         "by_section_type": by_type,
+        "detected_in_text": detected_in_text,
         "table_span_ids": tables,
         "figure_caption_span_ids": figures,
-        "section_types_present": sorted(by_type),
+        "section_types_present": present,
     }
+
+
+def _detect_section_types_in_text(text: str) -> list[str]:
+    found: list[str] = []
+    body = text or ""
+    for section_type, pattern in _SECTION_PATTERNS:
+        if pattern.search(body) and section_type not in found:
+            found.append(section_type)
+    return found
 
 
 def score_extraction_quality(spans: list[InputSpan], raw_metadata: dict[str, Any]) -> dict[str, Any]:
     character_count = sum(len(span.text) for span in spans)
     section_types = {(span.section_type or "OTHER").upper() for span in spans}
+    for span in spans:
+        section_types.update(_detect_section_types_in_text(span.text))
     useful_sections = section_types & {
         "ABSTRACT",
         "INTRODUCTION",

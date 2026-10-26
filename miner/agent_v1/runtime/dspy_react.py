@@ -61,7 +61,9 @@ class DspyReActRuntime:
             return program(
                 skill_instructions=_runtime_instructions(skill_pack),
                 request_json=json.dumps(request.model_dump(mode="json"), indent=2, ensure_ascii=False),
-                source_payload_json=(run_dir / request.source_payload_path).read_text(encoding="utf-8"),
+                # Compact overview only: full spans stay on disk for tools. Dumping
+                # 60k+ chars into every ReAct turn makes cha86 latency/timeouts worse.
+                source_payload_json=_compact_source_overview(run_dir / request.source_payload_path),
                 output_schema_json=(run_dir / request.output_schema_path).read_text(encoding="utf-8"),
                 coverage_requirements_json=json.dumps(_coverage_requirements(request), indent=2, ensure_ascii=False),
                 validation_feedback_json=(
@@ -127,6 +129,38 @@ def _coverage_requirements(request: AgentRequest) -> dict[str, Any]:
     }
 
 
+def _compact_source_overview(source_payload_path: Path, *, preview_chars: int = 180) -> str:
+    """Build a tool-oriented source overview instead of embedding every span."""
+    try:
+        payload = json.loads(source_payload_path.read_text(encoding="utf-8"))
+    except Exception:
+        return "{}"
+    spans = [span for span in payload.get("spans", []) or [] if isinstance(span, dict)]
+    overview = {
+        "schema": "claims_source_overview_v1",
+        "note": (
+            "Full span text is NOT inline. Use read_section_index, search_source_text, "
+            "and read_source_span(span_id) before writing quotes."
+        ),
+        "paper": payload.get("paper") or {},
+        "source_type": payload.get("source_type"),
+        "section_index": payload.get("section_index") or {},
+        "extraction_quality": payload.get("extraction_quality") or {},
+        "source_integrity": payload.get("source_integrity") or {},
+        "span_catalog": [
+            {
+                "span_id": span.get("span_id"),
+                "page": span.get("page"),
+                "section_type": span.get("section_type"),
+                "section_name": span.get("section_name"),
+                "preview": str(span.get("text") or "")[:preview_chars],
+            }
+            for span in spans
+        ],
+    }
+    return json.dumps(overview, indent=2, ensure_ascii=False)
+
+
 def _runtime_instructions(skill_pack: SkillPack) -> str:
     """Compact SN111 instructions.
 
@@ -145,6 +179,7 @@ def _runtime_instructions(skill_pack: SkillPack) -> str:
             f"# Skill: {skill_name}",
             "You are the Claims agent_v1 miner. Produce one strict agent_output.json artifact.",
             protocol,
+            "source_payload_json is a COMPACT overview only. Fetch evidence with tools before quoting.",
             "Do not invent quotes. Prefer 3-7 central claims with verbatim source quotes.",
             "Empty logic.claims is always invalid. Never return a skeleton without claims/evidence/experiments.",
             "Tools: read_section_index, search_source_text, read_source_span, read_source_payload,",

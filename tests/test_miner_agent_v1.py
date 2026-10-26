@@ -1508,12 +1508,19 @@ def test_agent_v1_preflight_accepts_grounded_artifact() -> None:
 
 def test_agent_v1_section_index_infers_results_headers(tmp_path: Path) -> None:
     path = tmp_path / "paper.txt"
-    path.write_text("# Results\n\nTreatment improved outcome in the trial.\n", encoding="utf-8")
+    path.write_text(
+        "# Methods\n\nWe randomized participants.\n\n# Results\n\nTreatment improved outcome in the trial.\n\n# Discussion\n\nLimits remain.\n",
+        encoding="utf-8",
+    )
     document = ingest_text(path, max_chars=None)
+    for span in document.spans:
+        span.section_type = "PAGE"
     payload = document_source_payload(document, max_chars=None)
 
-    assert "RESULTS" in payload["section_index"]["section_types_present"]
+    present = set(payload["section_index"]["section_types_present"])
+    assert {"METHODS", "RESULTS", "DISCUSSION"} <= present
     assert payload["extraction_quality"]["empty"] is False
+    assert payload["extraction_quality"]["useful_section_count"] >= 3
 
 
 def test_agent_v1_runner_blocks_duplicate_claim_submission(monkeypatch, tmp_path: Path) -> None:

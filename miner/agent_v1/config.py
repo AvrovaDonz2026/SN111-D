@@ -99,7 +99,7 @@ class AgentV1Config(BaseModel):
             overload_backoff_seconds=float(os.getenv("SUBNET_CLAIMS_AGENT_OVERLOAD_BACKOFF_SECONDS", "5")),
             overload_backoff_max_seconds=float(os.getenv("SUBNET_CLAIMS_AGENT_OVERLOAD_BACKOFF_MAX_SECONDS", "60")),
             cli_command=shlex.split(os.getenv("SUBNET_CLAIMS_AGENT_CLI_COMMAND", "")),
-        }
+        )
 
     def require_api_key(self) -> str:
         if not self.api_key:

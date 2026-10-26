@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Callable
 
 from ..artifact import materialize_agent_artifact
+from ..local_repair import repair_artifact_grounding
 from ..preflight import normalize_quote_text, run_preflight
 from ..skillpack import SkillPack
 
@@ -142,10 +143,18 @@ class AgentToolbox:
             source_path = self.run_dir / "source_payload.json"
             if source_path.exists():
                 source_payload = json.loads(source_path.read_text(encoding="utf-8"))
+            local_actions: list[dict[str, str]] = []
+            if source_payload is not None:
+                artifact, local_actions = repair_artifact_grounding(artifact, source_payload)
             issues = run_preflight(artifact, source_payload=source_payload, require_source_grounding=True)
         except Exception as exc:
             issues = [{"path": "$", "code": "invalid_json_or_schema", "message": str(exc)}]
-        return json.dumps({"issue_count": len(issues), "issues": issues}, indent=2, ensure_ascii=False)
+            local_actions = []
+        return json.dumps(
+            {"issue_count": len(issues), "issues": issues, "local_repairs": local_actions},
+            indent=2,
+            ensure_ascii=False,
+        )
 
     def submit_agent_artifact(self, candidate_json: str) -> str:
         validation = json.loads(self.validate_agent_artifact(candidate_json))

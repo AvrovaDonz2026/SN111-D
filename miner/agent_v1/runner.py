@@ -15,6 +15,7 @@ from .runtime import AgentRequest, build_agent_runtime
 from .runtime.usage import merge_usage
 from .schema import AGENT_JSON_SCHEMA_FILENAME, agent_json_schema, write_agent_json_schema
 from .skillpack import load_skill_pack
+from .local_repair import artifact_repair_rank, repair_artifact_grounding
 from .preflight import run_preflight
 
 
@@ -182,8 +183,12 @@ class AgentV1Runner:
         source_payload: dict[str, Any],
     ) -> tuple[Artifact, dict[str, Any]]:
         feedback: dict[str, Any] = {}
-        last_raw: dict[str, Any] = {}
         manifests: list[dict[str, Any]] = []
+        best: (
+            tuple[tuple[int, int, int], Artifact, list[dict[str, Any]], list[dict[str, str]], list[dict[str, Any]]]
+            | None
+        ) = None
+        paper_fallback = document.paper.model_dump(mode="json")
         for attempt in range(self.config.max_repair_attempts):
             (run_dir / "validation_feedback.json").write_text(
                 json.dumps(feedback, indent=2, ensure_ascii=False),
@@ -203,33 +208,60 @@ class AgentV1Runner:
             manifests.append(result.manifest)
             self._write_runtime_files(run_dir, result.manifest, result.stdout, result.stderr)
             raw = _read_json_object(result.output_path)
-            last_raw = raw
             schema_diagnostics = unknown_field_diagnostics(raw)
-            artifact = materialize_agent_artifact(raw, fallback_paper=document.paper.model_dump(mode="json"))
+            artifact = materialize_agent_artifact(raw, fallback_paper=paper_fallback)
+            local_actions: list[dict[str, str]] = []
+            if self.config.require_source_grounding:
+                artifact, local_actions = repair_artifact_grounding(artifact, source_payload)
+                if local_actions:
+                    (run_dir / f"local_repair_attempt_{attempt + 1}.json").write_text(
+                        json.dumps(local_actions, indent=2, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                    logger.info(
+                        "agent_v1 attempt %s applied %s local grounding repair(s)",
+                        attempt + 1,
+                        len(local_actions),
+                    )
             issues = run_preflight(
                 artifact,
                 source_payload=source_payload,
                 require_source_grounding=self.config.require_source_grounding,
             )
             issues.extend(_unknown_field_issues(schema_diagnostics))
+            rank = artifact_repair_rank(artifact, len(issues))
+            if best is None or rank > best[0]:
+                best = (rank, artifact, issues, local_actions, schema_diagnostics)
             if not issues:
                 return artifact, _runtime_metrics(manifests)
+            # Never ask the model to regenerate from an empty skeleton if we already
+            # have a non-empty candidate; focus feedback on the best so far.
+            feedback_artifact = best[1]
+            feedback_issues = best[2]
             feedback = {
-                "instruction": "Previous agent_v1 JSON failed deterministic preflight. Return a full corrected JSON object, not a patch.",
+                "instruction": (
+                    "Previous agent_v1 JSON failed deterministic preflight after local quote repair. "
+                    "Return a full corrected JSON object, not a patch. "
+                    "Do not drop existing valid claims."
+                ),
                 "attempt": attempt + 1,
-                "issues": issues,
+                "issues": feedback_issues,
+                "local_repairs_applied": best[3],
+                "kept_claim_count": len(feedback_artifact.logic.claims),
                 "repair_requirements": [
-                    "Fix every unresolved proof, evidence, verifies, and linked_claim reference.",
-                    "Every source quote must be a contiguous verbatim substring of the cited source span after PDF normalization.",
-                    "Use read_source_span(span_id) before rewriting quotes; do not paraphrase evidence.",
+                    "Keep every already-valid claim/evidence/experiment unless it is duplicated.",
+                    "Fix only broken quotes/refs by calling read_source_span and copying contiguous verbatim text.",
+                    "Do not return an empty logic.claims skeleton.",
                     "If coverage is insufficient, add distinct source-grounded claims with their own proof experiments and evidence records.",
-                    "Do not remove valid existing claims to satisfy coverage; expand and repair the artifact.",
                     "Prefer local repairs of broken quotes/refs over regenerating an entirely different artifact.",
                 ],
             }
             logger.info("agent_v1 attempt %s produced %s validation issue(s)", attempt + 1, len(issues))
-        artifact = materialize_agent_artifact(last_raw, fallback_paper=document.paper.model_dump(mode="json"))
-        artifact.metadata["_schema_diagnostics"] = unknown_field_diagnostics(last_raw)
+        assert best is not None
+        artifact = best[1]
+        artifact.metadata["_schema_diagnostics"] = best[4]
+        artifact.metadata["local_repair_actions"] = best[3]
+        artifact.metadata["repair_kept_best_candidate"] = True
         return artifact, _runtime_metrics(manifests)
 
     def _write_run_inputs(

@@ -1458,6 +1458,46 @@ def test_agent_v1_preflight_rejects_ungrounded_quotes() -> None:
     assert "foobar" == normalize_quote_text("foo-\nbar")
 
 
+def test_agent_v1_local_repair_fixes_paraphrased_quotes() -> None:
+    from miner.agent_v1.local_repair import repair_artifact_grounding
+
+    payload = _valid_ara_payload(span_id="span-1", quote="Treatment A made recovery much better somehow.")
+    artifact = materialize_agent_artifact(payload)
+    source_payload = {
+        "spans": [
+            {
+                "span_id": "span-1",
+                "text": "In a sample of 120 participants, Treatment A reduced median recovery time from 10 days in the control group to 7 days.",
+            }
+        ]
+    }
+
+    repaired, actions = repair_artifact_grounding(artifact, source_payload)
+    issues = run_preflight(repaired, source_payload=source_payload, require_source_grounding=True)
+
+    assert actions
+    assert any(action["code"].startswith("quote_") for action in actions)
+    assert quote_in_span(repaired.logic.claims[0].sources[0].quote or "", source_payload["spans"][0]["text"])
+    assert not any(issue["code"] == "quote_not_in_source_span" for issue in issues)
+
+
+def test_agent_v1_local_repair_strips_unsupported_qualifiers() -> None:
+    from miner.agent_v1.local_repair import repair_artifact_grounding
+
+    payload = _valid_ara_payload(span_id="span-1", quote="Treatment improved outcome")
+    payload["logic"]["claims"][0]["statement"] = "Treatment causally and significantly improved outcome."
+    artifact = materialize_agent_artifact(payload)
+    source_payload = {"spans": [{"span_id": "span-1", "text": "Treatment improved outcome in the sample."}]}
+
+    repaired, actions = repair_artifact_grounding(artifact, source_payload)
+    issues = run_preflight(repaired, source_payload=source_payload, require_source_grounding=True)
+
+    assert any(action["code"] == "qualifier_stripped" for action in actions)
+    assert "causal" not in repaired.logic.claims[0].statement.casefold()
+    assert "significant" not in repaired.logic.claims[0].statement.casefold()
+    assert not any(issue["code"] == "claim_qualifier_not_in_source" for issue in issues)
+
+
 def test_agent_v1_preflight_accepts_grounded_artifact() -> None:
     payload = _valid_ara_payload(span_id="span-1", quote="Treatment improved outcome")
     artifact = materialize_agent_artifact(payload)
